@@ -17,7 +17,7 @@
 
 `C` = Claude · `X` = Codex. Each battery shows the **remaining %** of a limit window — full & green means plenty left, red means almost out. Click for a detailed breakdown with reset times.
 
-Built as a single [SwiftBar](https://github.com/swiftbar/SwiftBar) plugin. **No dependencies beyond your shell** — the battery icons are rendered as PNGs from scratch in pure JavaScript (`node:zlib` only), so there's no image library, no network calls, and nothing leaves your machine.
+Built as a single [SwiftBar](https://github.com/swiftbar/SwiftBar) plugin — one self-contained script, **no third-party libraries**. The battery icons are rendered as PNGs from scratch in pure JavaScript (`node:zlib` only), so there's no image library, no `npm install`, no network calls, and nothing leaves your machine. (The only optional extra, `ccusage`, just adds a cost breakdown in the dropdown.)
 
 ---
 
@@ -55,7 +55,7 @@ Colors follow a traffic-light scale: green ≥ 50 % left, amber < 50 %, red < 20
 | **[bun](https://bun.sh)** | ✅ | `curl -fsSL https://bun.sh/install \| bash` |
 | **Claude Code** | ✅ for `C` batteries | needs `~/.claude/MEMORY/STATE/usage-cache.json` to exist |
 | **Codex CLI** | optional | for the `X` batteries; without it, only Claude is shown |
-| **[ccusage](https://github.com/ryoppippi/ccusage)** | auto-installed | powers the cost / token / per-model breakdown |
+| **[ccusage](https://github.com/ryoppippi/ccusage)** | optional | adds the cost / token / per-model breakdown in the dropdown — **the battery works fully without it** |
 
 > **Note:** This widget reads *your own local usage files*. If you don't use Claude Code (or Codex), there simply won't be any data to display.
 
@@ -72,9 +72,10 @@ cd claude-codex-battery
 `install.sh` will:
 
 1. Verify **bun** and **SwiftBar** are present (and tell you how to install them if not)
-2. Install **ccusage** if missing
-3. Copy the plugin into `~/.swiftbar-plugins/`, rewriting the shebang to your machine's `bun` path *(SwiftBar runs plugins with a minimal `PATH`, so an absolute shebang is required)*
-4. Point SwiftBar at the plugin folder and launch it
+2. Copy the plugin into `~/.swiftbar-plugins/`, rewriting the shebang to your machine's `bun` path *(SwiftBar runs plugins with a minimal `PATH`, so an absolute shebang is required)*
+3. Point SwiftBar at the plugin folder and launch it
+
+No `npm install`, no bundled libraries — the plugin is a single self-contained script.
 
 The battery appears in your menu bar within a few seconds. It refreshes **every 2 minutes** (the `.2m.` in the filename).
 

@@ -23,12 +23,12 @@ if [ ! -d "/Applications/SwiftBar.app" ]; then
 fi
 echo "✅ SwiftBar"
 
-# 3) ccusage (없으면 자동 설치)
-if ! command -v ccusage >/dev/null 2>&1 && [ ! -x "$HOME/.bun/bin/ccusage" ]; then
-  echo "ℹ️  ccusage 설치 중..."
-  bun install -g ccusage
+# 3) ccusage (선택 — 없어도 배터리는 정상. 드롭다운의 비용/모델별 상세에만 사용)
+if command -v ccusage >/dev/null 2>&1 || [ -x "$HOME/.bun/bin/ccusage" ]; then
+  echo "✅ ccusage (드롭다운 비용 상세 표시됨)"
+else
+  echo "ⓘ  ccusage 없음 — 배터리 정상, 드롭다운 비용 상세만 생략 (원하면: bun add -g ccusage)"
 fi
-echo "✅ ccusage"
 
 # 4) codex (선택 — 없으면 Codex 배터리는 안 뜨고 Claude만 표시)
 if command -v codex >/dev/null 2>&1; then

@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 // <xbar.title>Claude & Codex Usage</xbar.title>
 // <xbar.version>v3.0</xbar.version>
-// <xbar.author>Claude Code community</xbar.author>
+// <xbar.author>개발부스러기</xbar.author>
 // <xbar.desc>Claude Code 5시간 블록 + Codex rate limit을 메뉴바에 배터리 아이콘으로 상시 표시</xbar.desc>
 // SwiftBar 플러그인: 1분마다 갱신. 메뉴바=배터리 잔량 아이콘(자체 PNG), 클릭=상세 게이지.
 
@@ -123,40 +123,40 @@ const _stroke = (cv, x, y, rw, rh, col) => {
 };
 // 5x7 픽셀 폰트 (캡슐 안 숫자 + 그룹 라벨 C/X)
 const NUM = {
-  0: ["01110", "10001", "10011", "10101", "11001", "10001", "01110"],
-  1: ["00100", "01100", "00100", "00100", "00100", "00100", "01110"],
-  2: ["01110", "10001", "00001", "00010", "00100", "01000", "11111"],
-  3: ["11111", "00010", "00100", "00010", "00001", "10001", "01110"],
-  4: ["00010", "00110", "01010", "10010", "11111", "00010", "00010"],
-  5: ["11111", "10000", "11110", "00001", "00001", "10001", "01110"],
-  6: ["00110", "01000", "10000", "11110", "10001", "10001", "01110"],
-  7: ["11111", "00001", "00010", "00100", "01000", "01000", "01000"],
-  8: ["01110", "10001", "10001", "01110", "10001", "10001", "01110"],
-  9: ["01110", "10001", "10001", "01111", "00001", "00010", "01100"],
-  C: ["01110", "10001", "10000", "10000", "10000", "10001", "01110"],
-  X: ["10001", "10001", "01010", "00100", "01010", "10001", "10001"],
+  0: ["0110", "1001", "1001", "1001", "1001", "0110"],
+  1: ["0010", "0110", "0010", "0010", "0010", "0111"],
+  2: ["0110", "1001", "0010", "0100", "1000", "1111"],
+  3: ["1110", "0001", "0110", "0001", "1001", "0110"],
+  4: ["0010", "0110", "1010", "1111", "0010", "0010"],
+  5: ["1111", "1000", "1110", "0001", "1001", "0110"],
+  6: ["0110", "1000", "1110", "1001", "1001", "0110"],
+  7: ["1111", "0001", "0010", "0100", "0100", "0100"],
+  8: ["0110", "1001", "0110", "1001", "1001", "0110"],
+  9: ["0110", "1001", "1001", "0111", "0001", "0110"],
+  C: ["0110", "1001", "1000", "1000", "1001", "0110"],
+  X: ["1001", "1001", "0110", "0110", "1001", "1001"],
 };
 function drawNum(cv, x, y, str, col) {
   let cx = x;
   for (const ch of str) {
     const g = NUM[ch];
     if (g)
-      for (let r = 0; r < 7; r++)
-        for (let c = 0; c < 5; c++)
+      for (let r = 0; r < 6; r++)
+        for (let c = 0; c < 4; c++)
           if (g[r][c] === "1") cv.set(cx + c, y + r, col);
-    cx += 6;
+    cx += 5;
   }
   return cx;
 }
-const numW = (s) => s.length * 6 - 1;
+const numW = (s) => s.length * 5 - 1;
 const heatRemain = (r) =>
   r < 20 ? [248, 81, 73] : r < 50 ? [210, 153, 34] : [63, 185, 80]; // PNG 픽셀용 RGB
 const heatRemainHex = (r) =>
   r < 20 ? "#f85149" : r < 50 ? "#d29922" : "#3fb950"; // SwiftBar color= 용 hex
 // 캡슐 하나: 테두리 + 잔량 채움 + 안에 잔량 숫자(100 포함, 항상 표시)
 function drawCapsule(cv, x, midY, remain, ink) {
-  const bw = 21,
-    bh = 11,
+  const bw = 18,
+    bh = 10,
     by = midY - Math.floor(bh / 2);
   _stroke(cv, x, by, bw, bh, ink);
   _rect(cv, x + bw, by + 3, 2, bh - 6, ink); // 단자
@@ -174,12 +174,12 @@ function drawCapsule(cv, x, midY, remain, ink) {
 // 캡슐 N개(items=[{label,remain}]). 그룹(C=Claude / X=Codex) 앞에 라벨 문자.
 function renderBatteryImage(dark, items) {
   const ink = dark ? [235, 235, 235] : [45, 45, 45];
-  const CAPW = 23,
+  const CAPW = 20,
     GAP = 5,
-    GGAP = 11,
+    GGAP = 10,
     PAD = 2,
     LBLGAP = 3;
-  const H = 13;
+  const H = 12;
   const midY = Math.floor(H / 2);
   // 폭 계산 (그룹 라벨 포함)
   let W = PAD * 2;
@@ -628,8 +628,11 @@ if (codex) {
 out.push("---");
 
 out.push("🔄 지금 새로고침 | refresh=true");
-out.push(
-  `📊 ccusage 대시보드 열기 | bash="${CCUSAGE}" param1=blocks param2=--active terminal=true`,
-);
+// ccusage가 있을 때만(선택 의존) 대시보드 바로가기 노출
+if (claude && !claude.error) {
+  out.push(
+    `📊 ccusage 대시보드 열기 | bash="${CCUSAGE}" param1=blocks param2=--active terminal=true`,
+  );
+}
 
 console.log(out.join("\n"));
