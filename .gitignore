@@ -1,3 +1,9 @@
 .DS_Store
 *.log
 .codex-refresh-ts
+
+# 로컬 설정 / 기획 문서 (공개 저장소에서 제외)
+.claude/
+docs/PORTING-PLAN.md
+docs/README.macos.md
+docs/samples/

@@ -1,168 +1,134 @@
-# 🔋 Claude & Codex Usage Battery
+# 🔋 Claude & Codex Usage Battery — Windows
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
-  <img src="https://img.shields.io/badge/platform-macOS-000000?logo=apple&logoColor=white" alt="Platform: macOS">
-  <img src="https://img.shields.io/badge/SwiftBar-plugin-FF9500" alt="SwiftBar plugin">
-  <img src="https://img.shields.io/badge/runtime-bun-14151A?logo=bun&logoColor=white" alt="Runtime: bun">
+  <img src="https://img.shields.io/badge/platform-Windows%2010%2F11-0078D6?logo=windows&logoColor=white" alt="Platform: Windows">
+  <img src="https://img.shields.io/badge/runtime-PowerShell%205.1-5391FE?logo=powershell&logoColor=white" alt="PowerShell 5.1">
   <img src="https://img.shields.io/badge/dependencies-none-brightgreen.svg" alt="Zero dependencies">
-  <a href="https://github.com/dennykim123/claude-codex-battery/stargazers"><img src="https://img.shields.io/github/stars/dennykim123/claude-codex-battery?style=flat&logo=github" alt="GitHub stars"></a>
 </p>
 
-> A macOS menu bar widget that shows your remaining **Claude Code** and **Codex** usage limits as battery icons — so you never have to open `/usage` again.
+> Windows **시스템 트레이**에 **Claude Code**와 **Codex**의 남은 사용량 한도를 배터리 아이콘으로 상시 표시합니다 — 더 이상 `/usage`를 열 필요가 없습니다.
 
-<p align="center">
-  <img src="docs/menubar@2x.png" alt="Menu bar battery widget" width="280">
-</p>
+이 프로젝트는 macOS SwiftBar 플러그인인 [dennykim123/claude-codex-battery](https://github.com/dennykim123/claude-codex-battery)를 **Windows로 포팅**한 것입니다. macOS에는 SwiftBar 메뉴바가 있지만 Windows에는 대응물이 없어, 동일한 UX를 **상주 PowerShell + 시스템 트레이 아이콘**으로 재구현했습니다.
 
-`C` = Claude · `X` = Codex. Each battery shows the **remaining %** of a limit window — full & green means plenty left, red means almost out. Click for a detailed breakdown with reset times.
+각 배터리는 한 한도 창(window)의 **남은 %** 를 보여줍니다 — 가득 찬 초록은 여유, 빨강은 거의 소진. 아이콘을 **좌클릭**하면 리셋 시각까지 포함한 상세 게이지가 뜹니다.
 
-Built as a single [SwiftBar](https://github.com/swiftbar/SwiftBar) plugin — one self-contained script, **no third-party libraries**. The battery icons are rendered as PNGs from scratch in pure JavaScript (`node:zlib` only), so there's no image library and no `npm install`. The only network call is an **optional once-a-day update check** ([see Updating](#updating)) — disable it and the widget makes none at all. (`ccusage` is an optional extra for the cost breakdown.)
+- `C5` · `CW` · `CF` = Claude **5시간** · **주간** · **Fable(최상위 모델 주간 캡)**
+- `X5` · `XW` = Codex **5시간** · **주간** (프리미엄 플랜은 크레딧 잔액)
+
+**서드파티 의존성 0** — Windows에 기본 탑재된 PowerShell 5.1과 .NET(System.Drawing / WinForms)만 사용합니다. 아이콘은 GDI로 직접 그리며, `npm install`도, bun도, 별도 런타임도 필요 없습니다.
 
 ---
 
-## What it shows
+## 무엇을 보여주나
 
-| Group | Batteries | Source |
-|-------|-----------|--------|
-| **`C` Claude** | 5-hour session · weekly · **Fable** (top-model weekly cap) | `~/.claude/MEMORY/STATE/usage-cache.json` — updated live by Claude Code |
-| **`X` Codex** | 5-hour · weekly (or credit balance on the premium plan) | `~/.codex/sessions/**/*.jsonl` → `rate_limits` |
+| 그룹 | 배터리 | 소스 |
+|------|--------|------|
+| **`C` Claude** | 5시간 세션 · 주간 · **Fable**(최상위 모델 주간 캡) | Anthropic **OAuth usage API** (`/usage`와 동일 소스) |
+| **`X` Codex** | 5시간 · 주간 (프리미엄은 크레딧 잔액) | `~/.codex/sessions/**/*.jsonl` → `rate_limits` |
 
-Click the widget for a dropdown with, per limit:
+좌클릭 시 드롭다운(한도별):
 
 ```
 Claude Code
-  5h remaining   ▕██████████████░░░░░░▏ 70%  (used 30%)  · resets 3h 18m
-  weekly         ▕██████▋░░░░░░░░░░░░░▏ 33%  (used 67%)  · resets 3d 21h
-  Fable          ▕████░░░░░░░░░░░░░░░░▏ 26%  (used 74%)  · resets 3d 21h
-  today by model ▕████████████▏ Fable $75 · Opus $46 · Sonnet $5 …
-
-Codex · prolite
-  5h remaining   ▕████████████████████▏ 100% (used 0%)
-  weekly         ▕████████████████▋░░░▏ 83%  (used 17%)
+  5시간 남음 ▕██████████████░░░░░░▏ 70%  (사용 30%)  ·  리셋 3h 18m
+  주간 남음  ▕██████▋░░░░░░░░░░░░░▏ 33%  (사용 67%)  ·  리셋 3d 21h
+  Fable 남음 ▕████░░░░░░░░░░░░░░░░▏ 26%  (사용 74%)  ·  리셋 3d 21h
 ```
 
-Colors follow a traffic-light scale: green ≥ 50 % left, amber < 50 %, red < 20 %.
+색은 신호등: 남음 ≥ 50% 초록, < 50% 노랑, ≤ 20% 빨강.
+
+> **Windows 트레이 참고:** macOS 메뉴바처럼 넓은 이미지를 걸 수 없어, 한도마다 **개별 정사각 아이콘**으로 나뉩니다. Windows 11은 새 트레이 아이콘을 기본으로 `^`(숨겨진 아이콘) 안에 넣으므로, 처음 한 번 **작업표시줄로 끌어다 고정**해 주세요.
 
 ---
 
-## Requirements
+## 요구사항
 
-| | Required? | Install |
+| | 필요? | 비고 |
 |---|---|---|
-| **macOS** | ✅ | — |
-| **[SwiftBar](https://github.com/swiftbar/SwiftBar)** | ✅ | `brew install swiftbar` |
-| **[bun](https://bun.sh)** | ✅ | `curl -fsSL https://bun.sh/install \| bash` |
-| **Claude Code** | ✅ for `C` batteries | needs `~/.claude/MEMORY/STATE/usage-cache.json` to exist |
-| **Codex CLI** | optional | for the `X` batteries; without it, only Claude is shown |
-| **[ccusage](https://github.com/ryoppippi/ccusage)** | optional | adds the cost / token / per-model breakdown in the dropdown — **the battery works fully without it** |
+| **Windows 10/11** | ✅ | — |
+| **PowerShell 5.1** | ✅ | 모든 Windows 10/11에 기본 탑재 |
+| **Claude Code** | `C` 배터리에 필요 | `~/.claude/.credentials.json`(OAuth 토큰)이 있어야 함 — Claude Code 로그인 상태 |
+| **Codex CLI** | 선택 | 있으면 `X` 배터리 표시. 없으면 Claude만 |
+| **[ccusage](https://github.com/ryoppippi/ccusage)** | 선택 | 드롭다운에 비용/모델별 상세 추가 — **없어도 배터리는 정상** |
 
-> **Note:** This widget reads *your own local usage files*. If you don't use Claude Code (or Codex), there simply won't be any data to display.
+> 이 위젯은 *당신의 로컬 사용량*을 읽습니다. Claude Code를 안 쓰면 표시할 데이터가 없습니다.
 
 ---
 
-## Install
+## 설치
 
-```bash
-git clone https://github.com/dennykim123/claude-codex-battery.git
+```powershell
+git clone https://github.com/QriusQuokka/claude-codex-battery.git
 cd claude-codex-battery
-./install.sh
+powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-`install.sh` will:
+`install.ps1`은:
 
-1. Verify **bun** and **SwiftBar** are present (and tell you how to install them if not)
-2. Copy the plugin into `~/.swiftbar-plugins/`, rewriting the shebang to your machine's `bun` path *(SwiftBar runs plugins with a minimal `PATH`, so an absolute shebang is required)*
-3. Point SwiftBar at the plugin folder and launch it
-4. Register SwiftBar as a login item, so the battery comes back automatically after a reboot
+1. 앱 파일을 `%LOCALAPPDATA%\claude-codex-battery\`에 복사
+2. 시작프로그램에 등록(재부팅 후 자동 실행) — 콘솔 창 없이 뜨는 `launch-hidden.vbs` 런처 사용
+3. 즉시 실행
 
-No `npm install`, no bundled libraries — the plugin is a single self-contained script.
+몇 초 안에 트레이에 배터리가 나타납니다. **2분마다** 갱신됩니다. (`-NoAutostart` / `-NoLaunch` 옵션으로 각각 건너뛸 수 있습니다.)
 
-The battery appears in your menu bar within a few seconds. It refreshes **every 2 minutes** (the `.2m.` in the filename).
+수동 실행만 원하면:
 
-### Manual install
-
-If you prefer not to run the script:
-
-```bash
-mkdir -p ~/.swiftbar-plugins
-# rewrite shebang to your bun path, then copy:
-sed "1s|.*|#!$(command -v bun)|" claude-codex-usage.2m.js > ~/.swiftbar-plugins/claude-codex-usage.2m.js
-chmod +x ~/.swiftbar-plugins/claude-codex-usage.2m.js
-defaults write com.ameba.SwiftBar PluginDirectory -string ~/.swiftbar-plugins
-open -a SwiftBar
+```powershell
+powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File claude-codex-battery-win.ps1 -Run
 ```
 
 ---
 
-## Updating
+## 업데이트
 
-The widget checks GitHub for a newer version **at most once a day** — a tiny background request that is the *only* network call it ever makes. When a new version is out, a green **🆕 update** row appears in the dropdown; click it to replace the plugin in place and refresh (your previous copy is kept as `.bak`).
+포크 레포의 `VERSION`을 **하루 최대 1회** 확인합니다(백그라운드, 유일한 그 외 네트워크 호출). 새 버전이 있으면 드롭다운에 초록 **🆕 업데이트** 항목이 뜨고, 클릭하면 제자리에서 교체 후 재시작합니다(이전본은 `.bak` 보존).
 
-Prefer to do it yourself? From your clone: `git pull && ./install.sh`.
+직접 하려면: `git pull` 후 `install.ps1` 재실행.
 
-To turn the check off entirely, comment out the `getUpdateInfo()` call near the bottom of the script — then the widget makes **zero** network calls.
-
----
-
-## Privacy & security
-
-- **No usage data leaves your machine.** Limits are read from local files and rendered locally; the only network call is the optional daily update check above.
-- **No secrets read.** It never touches `auth.json`, credentials, or keychains.
-- **No conversation content.** From Codex session logs it parses only the `rate_limits` object (numbers), never the messages.
-- Usage values are read at runtime — **nothing is baked into the code**, so sharing the script shares no data.
+완전히 끄려면 `claude-codex-battery-win.ps1` 상단의 `$EnableUpdateCheck = $false`.
 
 ---
 
-## How accurate / in-sync is it?
+## 프라이버시 & 보안
 
-**Claude — effectively real-time.** The limits come from `usage-cache.json`, the *same* rate-limit data Claude Code uses for its own `/usage`. The widget just reads that file (every 2 min), so its numbers track Claude's. Measured on a live machine: the widget's **weekly and Fable readings matched the source file exactly**; the 5-hour figure differed only by the live drift between two reads a minute apart.
-
-**Codex — as fresh as your last Codex run.** Codex writes rate-limit data to its session logs *only while you use it*, and records no reset time. So the value is a snapshot from your most recent session — the dropdown labels it "measured N ago" and warns past 3h. Run Codex and it re-syncs instantly.
-
-**TL;DR** — Claude is live (same source as `/usage`); Codex is a clearly-labeled snapshot from your last session, not a live feed.
-
----
-
-## How it works
-
-The whole thing is one `.js` file run by bun on a timer.
-
-- **Battery icons** are drawn pixel-by-pixel into an RGBA buffer and encoded to PNG using only `node:zlib` (hand-rolled CRC32 + IHDR/IDAT/IEND chunks). A 5×7 bitmap font renders the numbers and the `C`/`X` group labels. SwiftBar displays the PNG at pixels ÷ 2 pt.
-- **Claude limits** come from `usage-cache.json`, which Claude Code keeps current. The Fable cap is the `weekly_scoped` entry.
-- **Codex limits** come from the newest session's `rate_limits`. The premium plan reports a `credits` object instead of percentages when exhausted; the widget handles both shapes.
-
-### Codex has one quirk
-
-Codex only writes limit data to session logs **while you use it**, and doesn't record a reset time when exhausted. So if you haven't run Codex in a while, the value can be stale. The widget:
-
-- flags values older than 3 hours in the dropdown, and
-- **optionally** runs `codex exec --sandbox read-only` in the background to refresh — but *only* when Codex is exhausted **and** the value is 2h+ old, at most once every 6 hours (≈4×/day, ~20k tokens each).
-
-If you'd rather it never spend tokens on its own, comment out the `maybeAutoRefreshCodex(codex)` call near the render section.
+- **사용량 데이터는 기기 밖으로 나가지 않습니다.** 값을 읽어 로컬에서 렌더링합니다.
+- **네트워크 호출은 딱 둘뿐입니다:**
+  1. **Claude usage API** (`https://api.anthropic.com/api/oauth/usage`) — Claude Code 본인과 **동일한** 엔드포인트/토큰으로 당신 계정의 사용률만 read-only 조회. Windows에는 원본 macOS가 읽던 로컬 `usage-cache.json`이 없어 이 API가 유일한 소스입니다.
+  2. **업데이트 체크** (GitHub `VERSION`) — 하루 1회.
+- **둘 다 끌 수 있습니다:** 상단 상수 `$EnableUsageApi = $false`, `$EnableUpdateCheck = $false`. 둘 다 끄면 네트워크 호출이 **0**입니다.
+- **비밀·대화 내용은 보내지 않습니다.** usage API 응답에는 사용률 %와 리셋 시각만 있습니다. Codex 로그에서는 `rate_limits` 숫자만 파싱합니다.
+- API 호출은 `.credentials.json`의 OAuth 액세스 토큰을 `Authorization` 헤더로 사용합니다(Anthropic 자사 API로만 전송) — 이는 원본의 "자격증명 안 읽음" 정책에 대한 **명시적 예외**이며, Windows에 로컬 캐시가 없기 때문입니다. 원치 않으면 위처럼 끄십시오.
 
 ---
 
-## Customizing
+## 동작 방식
 
-| Want to change | Where |
+단일 PowerShell 스크립트가 타이머(2분)로 상주하며:
+
+- **트레이 아이콘**은 `System.Drawing.Bitmap`에 캡슐/픽셀폰트 숫자를 그려 `GetHicon()`으로 아이콘화합니다. 핸들은 매 갱신마다 `DestroyIcon`으로 해제해 GDI 누수를 막습니다.
+- **다크/라이트**는 레지스트리 `SystemUsesLightTheme`로 감지해 매 갱신 반영합니다.
+- **Claude 한도**는 usage API 응답에서 옵니다. 응답은 원본이 읽던 `usage-cache.json`의 상위집합이라(`five_hour` / `seven_day` / `limits[]`), 파싱 로직을 거의 그대로 재사용했습니다. API는 공격적 rate-limit이 있어 **최소 5분 간격**으로만 호출하고 결과를 `%LOCALAPPDATA%\claude-codex-battery\usage-cache.json`에 캐시합니다.
+- **Codex 한도**는 가장 최근 세션 로그의 `rate_limits`에서 옵니다.
+
+---
+
+## 커스터마이즈 (스크립트 상단 상수)
+
+| 바꾸고 싶은 것 | 위치 |
 |---|---|
-| Refresh interval | filename `.2m.` → `.1m.`, `.5m.`, `.30s.`, … |
-| Battery size | `drawCapsule`: `bw` / `bh` (5×7 font sets the floor) |
-| Color thresholds | `heatRemain` / `heatRemainHex` (20 % / 50 %) |
-| Disable Codex auto-refresh | comment out `maybeAutoRefreshCodex(codex)` |
-| Which Claude limits to show | the `battItems.push(...)` block |
+| Claude usage API on/off | `$EnableUsageApi` |
+| 업데이트 체크 on/off | `$EnableUpdateCheck` |
+| API 호출 최소 간격 | `$UsageApiThrottleSec` (기본 300초) |
+| Codex 소진 시 자동 갱신 | `$CodexAutoRefresh` (기본 off) |
+| 갱신 주기 | `Start-ResidentTray`의 `Timer.Interval` (기본 120000ms) |
 
 ---
 
-## Why a SwiftBar plugin (and not a standalone app)?
+## macOS 사용자
 
-A single script stays dependency-free, easy to audit, and trivial to fork — and its audience (Claude Code / Codex developers) already lives in the terminal, so `brew install swiftbar` is no barrier. A native `.app` would drop the SwiftBar requirement but adds a Swift codebase, Apple code-signing + notarization ($99/yr), and ongoing maintenance. **Roadmap:** if there's enough demand, ship a signed one-click menu-bar `.app` (likely bundling SwiftBar) for non-terminal users.
+이 저장소는 **Windows 전용**입니다. macOS 메뉴바 버전은 원본 [upstream 프로젝트](https://github.com/dennykim123/claude-codex-battery)를 이용하세요.
 
-## Contributing
-
-Issues and PRs welcome — especially for other plans/tools (e.g. mapping additional `rate_limit` shapes, or adding providers). Keep it dependency-free.
-
-## License
+## 라이선스
 
 [MIT](LICENSE)
