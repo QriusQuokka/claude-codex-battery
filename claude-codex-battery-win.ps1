@@ -34,7 +34,7 @@ param(
 # ══════════════════════════════════════════════════════════════════
 #  CONFIG — 상단 상수 (사용자가 조정하는 지점)
 # ══════════════════════════════════════════════════════════════════
-$script:VERSION            = '1.1.1-win'              # 이 Windows 포트의 버전
+$script:VERSION            = '1.1.2-win'              # 이 Windows 포트의 버전
 $script:EnableUsageApi     = $true                    # ★ Claude 사용량 API 호출 on/off (프라이버시 opt-out 지점)
 $script:ClaudeUaVersion    = '2.1.206'                # User-Agent: claude-code/<이 값> (형식이 중요, 정확한 값은 무관)
 $script:UsageApiThrottleSec = 300                     # API 최소 호출 간격(초). 429 방지 — 렌더보다 훨씬 길게.
@@ -713,10 +713,10 @@ function Draw-PixelString {
 }
 function Measure-PixelString { param([string]$Str) return ($Str.Length * ($script:GLYPH_W + 1) - 1) }
 
-# 배터리 아이콘 하나를 Bitmap으로 렌더. remain=잔량%, tag=창 식별 글자(5/W/F), dark, size(정사각 px).
-#   가로 캡슐(테두리+좌측 채움) + 캡슐 안 잔량 2자리 숫자 + 좌상단 창 태그.
+# 배터리 아이콘 하나를 Bitmap으로 렌더. service=claude/codex, tag=창 식별(5/W/F).
+#   Claude는 오른쪽 단자+C, Codex는 왼쪽 단자+X. 창은 우상단 점 1/2/3개로 식별한다.
 function New-BatteryBitmap {
-  param([double]$Remain, [string]$Tag, [bool]$Dark, [int]$Size = 32, [bool]$Stale = $false)
+  param([double]$Remain, [string]$Tag, [string]$Service, [bool]$Dark, [int]$Size = 32, [bool]$Stale = $false)
   $bmp = New-Object System.Drawing.Bitmap($Size, $Size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
   $g = $null; $ink = $null; $dkInk = $null; $fillBrush = $null
   try {
@@ -736,11 +736,13 @@ function New-BatteryBitmap {
     # 논리 그리드: 픽셀 폰트 배율 sc. size=32 → sc=2 (숫자 8px 높이). size=16 → sc=1.
     $sc = [math]::Max(1, [math]::Floor($Size / 16))
 
-    # 상단 태그 밴드 + 하단 캡슐로 분리 (겹침 방지). 태그는 size>=24 에서만 표시.
-    $showTag = ($Tag -and $Size -ge 24)
-    $topPad = if ($showTag) { [int]($Size * 0.30) } else { [int]($Size * 0.14) }
-    $botPad = [int]($Size * 0.12)
-    $bx = [int]($Size * 0.05); $bw = [int]($Size * 0.82)
+    # 16px에서도 서비스/창을 구분하도록 상단 식별 밴드를 항상 확보한다.
+    $showIdentity = ($Service -eq 'claude' -or $Service -eq 'codex')
+    $topPad = if ($showIdentity) { [math]::Max(7, [int]($Size * 0.30)) } else { [int]($Size * 0.14) }
+    $botPad = if ($Size -le 16) { 0 } else { [int]($Size * 0.12) }
+    $nubW = [math]::Max(1,[int]($Size/16))
+    $bx = if ($Service -eq 'codex') { $nubW } else { [int]($Size * 0.05) }
+    $bw = [int]($Size * 0.82)
     $by = $topPad; $bh = $Size - $topPad - $botPad
     $border = [math]::Max(1, [int]($Size / 16))
     # 테두리 (사각 캡슐)
@@ -748,9 +750,10 @@ function New-BatteryBitmap {
     $g.FillRectangle($ink, $bx, $by + $bh - $border, $bw, $border)       # 하
     $g.FillRectangle($ink, $bx, $by, $border, $bh)                       # 좌
     $g.FillRectangle($ink, $bx + $bw - $border, $by, $border, $bh)       # 우
-    # 단자(nub)
+    # 단자(nub): Claude=오른쪽, Codex=왼쪽 — 색을 보지 않아도 실루엣으로 서비스 구분.
     $nubH = [int]($bh * 0.4)
-    $g.FillRectangle($ink, $bx + $bw, $by + [int](($bh - $nubH)/2), [math]::Max(1,[int]($Size/16)), $nubH)
+    $nubX = if ($Service -eq 'codex') { $bx - $nubW } else { $bx + $bw }
+    $g.FillRectangle($ink, $nubX, $by + [int](($bh - $nubH)/2), $nubW, $nubH)
     # 잔량 채움 (좌측부터)
     $innerX = $bx + $border; $innerY = $by + $border
     $innerW = $bw - 2 * $border; $innerH = $bh - 2 * $border
@@ -767,13 +770,20 @@ function New-BatteryBitmap {
     $numYlogical = [int]([math]::Floor(($by + ($bh - $script:GLYPH_H * $sc)/2) / $sc))
     Draw-PixelString -G $g -X $numXlogical -Y $numYlogical -Str $numStr -Sc $sc -Brush $ink -AltBrush $dkInk -BoundaryX $fillBoundaryLogical | Out-Null
 
-    # 창 태그 (상단 밴드 중앙). 서비스(C/X)는 색/툴팁/순서로 구분.
-    if ($showTag) {
-      $tagSc = [math]::Max(1, [int]($Size / 20))
-      $tagWpx = (Measure-PixelString $Tag) * $tagSc
-      $tagXlogical = [int]([math]::Floor(($bx + ($bw - $tagWpx)/2) / $tagSc))
-      $tagYlogical = [int]([math]::Floor((($topPad - $script:GLYPH_H * $tagSc)/2) / $tagSc))
-      Draw-PixelString -G $g -X $tagXlogical -Y $tagYlogical -Str $Tag -Sc $tagSc -Brush $ink | Out-Null
+    # 상단 식별: 좌측 C/X 픽셀 글자 + 우측 창 마커(5시간=1, 주간=2, Fable=3).
+    if ($showIdentity) {
+      $idSc = [math]::Max(1, [int]($Size / 24))
+      $serviceTag = if ($Service -eq 'claude') { 'C' } else { 'X' }
+      $idY = [int]([math]::Max(0, [math]::Floor(($topPad - $script:GLYPH_H * $idSc) / (2 * $idSc))))
+      Draw-PixelString -G $g -X 1 -Y $idY -Str $serviceTag -Sc $idSc -Brush $ink | Out-Null
+      $markerCount = if ($Tag -eq '5') { 1 } elseif ($Tag -eq 'W') { 2 } elseif ($Tag -eq 'F') { 3 } else { 0 }
+      $dot = [math]::Max(1, [int]($Size / 16))
+      $gap = $dot
+      for ($i = 0; $i -lt $markerCount; $i++) {
+        $mx = $Size - 2 - $dot - $i * ($dot + $gap)
+        $my = [math]::Max(0, [int](($topPad - $dot) / 2))
+        $g.FillRectangle($ink, $mx, $my, $dot, $dot)
+      }
     }
 
     return $bmp
@@ -787,8 +797,8 @@ function New-BatteryBitmap {
 
 # Bitmap → [System.Drawing.Icon]. 반환 객체에 .Icon 과 해제용 .Handle 포함.
 function New-BatteryIcon {
-  param([double]$Remain, [string]$Tag, [bool]$Dark, [int]$Size = 32, [bool]$Stale = $false)
-  $bmp = New-BatteryBitmap -Remain $Remain -Tag $Tag -Dark $Dark -Size $Size -Stale $Stale
+  param([double]$Remain, [string]$Tag, [string]$Service, [bool]$Dark, [int]$Size = 32, [bool]$Stale = $false)
+  $bmp = New-BatteryBitmap -Remain $Remain -Tag $Tag -Service $Service -Dark $Dark -Size $Size -Stale $Stale
   $hicon = [IntPtr]::Zero
   $icon = $null
   try {
@@ -876,9 +886,10 @@ if ($RenderTest) {
   $outDir = if ($RenderOut) { $RenderOut } else { Join-Path $env:TEMP 'ccb-render' }
   if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
   $samples = @(
-    @{ tag='5'; remain=72; stale=$false }, @{ tag='W'; remain=33; stale=$false }, @{ tag='F'; remain=8; stale=$false },
-    @{ tag='5'; remain=100; stale=$false }, @{ tag='5'; remain=100; stale=$true },
-    @{ tag='X'; remain=54; stale=$false }, @{ tag='W'; remain=19; stale=$false }
+    @{ service='claude'; tag='5'; remain=72; stale=$false }, @{ service='claude'; tag='W'; remain=33; stale=$false },
+    @{ service='claude'; tag='F'; remain=8; stale=$false }, @{ service='codex'; tag='5'; remain=54; stale=$false },
+    @{ service='codex'; tag='W'; remain=19; stale=$false }, @{ service='claude'; tag='5'; remain=100; stale=$false },
+    @{ service='codex'; tag='5'; remain=100; stale=$true }
   )
   # 크기별로 6개 샘플을 한 줄 스트립으로 (작업표시줄 유사 배경 위) — 현실적 가독성 판단용
   foreach ($dark in @($true,$false)) {
@@ -891,7 +902,7 @@ if ($RenderTest) {
       $sg.Clear($bg)
       $x = 0
       foreach ($sm in $samples) {
-        $b = New-BatteryBitmap -Remain $sm.remain -Tag $sm.tag -Dark $dark -Size $size -Stale $sm.stale
+        $b = New-BatteryBitmap -Remain $sm.remain -Tag $sm.tag -Service $sm.service -Dark $dark -Size $size -Stale $sm.stale
         $sg.DrawImage($b, $x, 0); $b.Dispose(); $x += $size + $gap
       }
       $sg.Dispose()
@@ -913,7 +924,7 @@ if ($RenderTest) {
       $sg.Clear($bg)
       $x = 0
       foreach ($it in $items) {
-        $b = New-BatteryBitmap -Remain $it.remain -Tag $it.tag -Dark $dark -Size $sz -Stale $it.stale
+        $b = New-BatteryBitmap -Remain $it.remain -Tag $it.tag -Service $it.service -Dark $dark -Size $sz -Stale $it.stale
         $sg.DrawImage($b, $x, 0); $b.Dispose(); $x += $sz + $gap
       }
       $sg.Dispose()
@@ -930,11 +941,11 @@ if ($RenderTest) {
 
 if ($LeakTest -gt 0) {
   # 워밍업: 어셈블리/GDI 초기화 1회성 오버헤드를 'before' 측정 전에 소진
-  for ($i = 0; $i -lt 5; $i++) { $w = New-BatteryIcon -Remain 50 -Tag '5' -Dark $true -Size 32; Remove-BatteryIcon $w }
+  for ($i = 0; $i -lt 5; $i++) { $w = New-BatteryIcon -Remain 50 -Tag '5' -Service 'claude' -Dark $true -Size 32; Remove-BatteryIcon $w }
   [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()
   $before = Get-GdiObjectCount
   for ($i = 0; $i -lt $LeakTest; $i++) {
-    $ico = New-BatteryIcon -Remain (Get-Random -Min 0 -Max 100) -Tag '5' -Dark $true -Size 32
+    $ico = New-BatteryIcon -Remain (Get-Random -Min 0 -Max 100) -Tag '5' -Service 'codex' -Dark $true -Size 32
     Remove-BatteryIcon $ico
   }
   [System.GC]::Collect(); [System.GC]::WaitForPendingFinalizers()
@@ -1320,7 +1331,7 @@ function Render-Tray {
       $newIcons += [pscustomobject]@{ Icon = $ic; Handle = $h; Tip = $placeholderTip }
     } else {
       foreach ($it in $items) {
-        $io = New-BatteryIcon -Remain $it.remain -Tag $it.tag -Dark $dark -Size $size -Stale $it.stale
+        $io = New-BatteryIcon -Remain $it.remain -Tag $it.tag -Service $it.service -Dark $dark -Size $size -Stale $it.stale
         $io | Add-Member -NotePropertyName Tip -NotePropertyValue $it.tip -Force
         $newIcons += $io
       }
@@ -1451,7 +1462,7 @@ if ($SelfTest) {
     $menu.Dispose()
     # NotifyIcon 생성/표시 없이 아이콘 객체만 검증
     $dark = Test-DarkMode
-    foreach ($it in $items) { $io = New-BatteryIcon -Remain $it.remain -Tag $it.tag -Dark $dark -Size 32 -Stale $it.stale; Remove-BatteryIcon $io }
+    foreach ($it in $items) { $io = New-BatteryIcon -Remain $it.remain -Tag $it.tag -Service $it.service -Dark $dark -Size 32 -Stale $it.stale; Remove-BatteryIcon $io }
     Write-Host "SelfTest: 예외 없음 ✅"
   } catch { $err += $_; Write-Host ("SelfTest 실패: {0}" -f $_.Exception.Message) -ForegroundColor Red; Write-Host $_.ScriptStackTrace }
   return
