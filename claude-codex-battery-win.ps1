@@ -34,7 +34,7 @@ param(
 # ══════════════════════════════════════════════════════════════════
 #  CONFIG — 상단 상수 (사용자가 조정하는 지점)
 # ══════════════════════════════════════════════════════════════════
-$script:VERSION            = '1.0.0-win'              # 이 Windows 포트의 버전
+$script:VERSION            = '1.1.0-win'              # 이 Windows 포트의 버전
 $script:EnableUsageApi     = $true                    # ★ Claude 사용량 API 호출 on/off (프라이버시 opt-out 지점)
 $script:ClaudeUaVersion    = '2.1.206'                # User-Agent: claude-code/<이 값> (형식이 중요, 정확한 값은 무관)
 $script:UsageApiThrottleSec = 300                     # API 최소 호출 간격(초). 429 방지 — 렌더보다 훨씬 길게.

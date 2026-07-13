@@ -38,6 +38,9 @@ Claude Code
 
 색은 신호등: 남음 ≥ 50% 초록, < 50% 노랑, ≤ 20% 빨강.
 
+리셋 시각은 지났지만 Codex가 아직 새 한도를 측정하지 못한 경우, 실제 100%로 오해하지 않도록
+배터리를 **빈 외곽선 + `?`**로 표시합니다.
+
 > **Windows 트레이 참고:** macOS 메뉴바처럼 넓은 이미지를 걸 수 없어, 한도마다 **개별 정사각 아이콘**으로 나뉩니다. Windows 11은 새 트레이 아이콘을 기본으로 `^`(숨겨진 아이콘) 안에 넣으므로, 처음 한 번 **작업표시줄로 끌어다 고정**해 주세요.
 
 ---
@@ -71,6 +74,9 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 3. 즉시 실행
 
 몇 초 안에 트레이에 배터리가 나타납니다. **2분마다** 갱신됩니다. (`-NoAutostart` / `-NoLaunch` 옵션으로 각각 건너뛸 수 있습니다.)
+
+갱신에 실패하면 트레이 툴팁과 메뉴에서 이유를 확인할 수 있습니다. 만료된 Claude 로그인은
+`재로그인 필요`, API 제한은 `레이트 리밋 · N분 후 재시도`, 네트워크 장애는 마지막 측정 경과 시간으로 표시됩니다.
 
 수동 실행만 원하면:
 
@@ -110,6 +116,8 @@ powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File claude-c
 - **다크/라이트**는 레지스트리 `SystemUsesLightTheme`로 감지해 매 갱신 반영합니다.
 - **Claude 한도**는 usage API 응답에서 옵니다. 응답은 원본이 읽던 `usage-cache.json`의 상위집합이라(`five_hour` / `seven_day` / `limits[]`), 파싱 로직을 거의 그대로 재사용했습니다. API는 공격적 rate-limit이 있어 **최소 5분 간격**으로만 호출하고 결과를 `%LOCALAPPDATA%\claude-codex-battery\usage-cache.json`에 캐시합니다.
 - **Codex 한도**는 가장 최근 세션 로그의 `rate_limits`에서 옵니다.
+- 데이터 조회는 별도 러너스페이스에서 실행하므로 느린 네트워크나 선택 의존성(`ccusage`)이 트레이 UI를 멈추지 않습니다.
+- 사용량 캐시는 임시 파일 작성 후 원자적으로 교체하며, 손상된 업데이트 스크립트는 설치 전에 구문 검사로 차단합니다.
 
 ---
 
