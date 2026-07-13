@@ -95,6 +95,22 @@ function Format-Duration {
   return ('{0}m' -f $m)
 }
 
+# Claude usage API 실패를 툴팁/메뉴에서 같은 문구로 표시한다.
+function Format-ClaudeFailure {
+  param($Failure, $MeasuredAt)
+  if (-not $Failure) { return '' }
+  $now = Get-UnixNow
+  if ($Failure.kind -eq 'auth') { return '⚠ 재로그인 필요 — Claude Code에서 /login' }
+  if ($Failure.kind -eq 'rateLimit') {
+    $retryAt = 0
+    try { $retryAt = [int64]$Failure.retryAt } catch {}
+    $mins = if ($retryAt -gt $now) { [math]::Max(1, [int][math]::Ceiling(($retryAt - $now) / 60.0)) } else { 1 }
+    return ('⚠ 레이트 리밋 — {0}분 후 재시도' -f $mins)
+  }
+  if ($MeasuredAt) { return ('⚠ 갱신 실패 — 마지막 측정 {0} 전' -f (Format-Duration ($now - [int64]$MeasuredAt))) }
+  return '⚠ 갱신 실패 — 측정 기록 없음'
+}
+
 # 토큰수 포맷 ("1.2B"/"3.4M"/"56K"/"789") — 원본 fmtTok 이식
 function Format-Tokens {
   param([double]$N)
@@ -169,7 +185,9 @@ function Invoke-ExternalCommand {
 #     API 응답은 원본 usage-cache.json의 상위집합 (docs/PORTING-PLAN.md §9.3)
 # ══════════════════════════════════════════════════════════════════
 
-# 캐시 파일 구조: { fetchedAt:<unix>, backoffUntil:<unix>, raw:<API 응답 그대로> }
+# 캐시 파일 구조:
+# { fetchedAt:<unix>, backoffUntil:<unix>, backoffInterval:<sec>, raw:<API 응답 그대로>,
+#   failure:{ kind:auth|rateLimit|network, statusCode, failedAt, retryAt } }
 function Read-UsageCache {
   if (-not (Test-Path $script:USAGE_CACHE)) { return $null }
   try { return (Get-Content $script:USAGE_CACHE -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { return $null }
@@ -180,26 +198,48 @@ function Write-UsageCache {
   try { ($Obj | ConvertTo-Json -Depth 12 -Compress) | Set-Content -Path $script:USAGE_CACHE -Encoding UTF8 } catch {}
 }
 
-# API 1회 호출 — 성공 시 원본 응답 객체, 실패 시 $null (절대 throw 안 함)
+# API 1회 호출 — 항상 { ok, raw, failure } 반환 (절대 throw 안 함).
+# failure를 값으로 반환해야 캐시를 거쳐 트레이 UI까지 실패 원인을 보낼 수 있다.
 function Invoke-UsageApi {
-  if (-not $script:EnableUsageApi) { return $null }
-  if (-not (Test-Path $script:CRED_FILE)) { return $null }
+  if (-not $script:EnableUsageApi) { return [pscustomobject]@{ ok=$false; raw=$null; failure=$null } }
+  $now = Get-UnixNow
+  $authFailure = { [pscustomobject]@{ kind='auth'; statusCode=401; failedAt=$now; retryAt=0 } }
+  if (-not (Test-Path $script:CRED_FILE)) { return [pscustomobject]@{ ok=$false; raw=$null; failure=(& $authFailure) } }
   $tok = $null
   try {
     $cred = Get-Content $script:CRED_FILE -Raw -Encoding UTF8 | ConvertFrom-Json
     $tok = $cred.claudeAiOauth.accessToken
-  } catch { return $null }
-  if (-not $tok) { return $null }
+  } catch { return [pscustomobject]@{ ok=$false; raw=$null; failure=(& $authFailure) } }
+  if (-not $tok) { return [pscustomobject]@{ ok=$false; raw=$null; failure=(& $authFailure) } }
   $headers = @{
     'Authorization'  = "Bearer $tok"
     'anthropic-beta' = 'oauth-2025-04-20'
     'Content-Type'   = 'application/json'
   }
   try {
-    return (Invoke-RestMethod -Uri $script:USAGE_API_URL -Headers $headers `
-              -UserAgent "claude-code/$script:ClaudeUaVersion" -Method GET -TimeoutSec 15)
+    $raw = Invoke-RestMethod -Uri $script:USAGE_API_URL -Headers $headers `
+              -UserAgent "claude-code/$script:ClaudeUaVersion" -Method GET -TimeoutSec 15
+    return [pscustomobject]@{ ok=$true; raw=$raw; failure=$null }
   } catch {
-    return $null   # 429/401/네트워크 — 호출부가 캐시로 폴백
+    $status = 0
+    $retryAt = 0
+    try { if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode } } catch {}
+    if ($status -eq 429) {
+      # Retry-After가 초 또는 HTTP 날짜일 수 있다. 읽지 못하면 호출부의 지수 백오프를 사용한다.
+      try {
+        $retryAfter = $_.Exception.Response.Headers['Retry-After']
+        [int64]$retrySec = 0
+        if ($retryAfter -and [int64]::TryParse([string]$retryAfter, [ref]$retrySec)) {
+          $retryAt = $now + [math]::Max(0, $retrySec)
+        } elseif ($retryAfter) {
+          $retryDate = [DateTimeOffset]::MinValue
+          if ([DateTimeOffset]::TryParse([string]$retryAfter, [ref]$retryDate)) { $retryAt = $retryDate.ToUnixTimeSeconds() }
+        }
+      } catch {}
+    }
+    $kind = if ($status -eq 401) { 'auth' } elseif ($status -eq 429) { 'rateLimit' } else { 'network' }
+    $failure = [pscustomobject]@{ kind=$kind; statusCode=$status; failedAt=$now; retryAt=$retryAt }
+    return [pscustomobject]@{ ok=$false; raw=$null; failure=$failure }
   }
 }
 
@@ -249,10 +289,10 @@ function Get-ClaudeUsage {
   $shouldCall = $script:EnableUsageApi -and ($Force -or ($cacheAge -ge $script:UsageApiThrottleSec)) -and (-not $backoffActive -or $Force)
 
   if ($shouldCall) {
-    $raw = Invoke-UsageApi
-    if ($raw) {
-      Write-UsageCache ([pscustomobject]@{ fetchedAt = $now; backoffUntil = 0; backoffInterval = 0; raw = $raw })
-      return (ConvertFrom-UsageRaw -Raw $raw -MeasuredAt $now)
+    $api = Invoke-UsageApi
+    if ($api.ok -and $api.raw) {
+      Write-UsageCache ([pscustomobject]@{ fetchedAt = $now; backoffUntil = 0; backoffInterval = 0; raw = $api.raw; failure = $null })
+      return (ConvertFrom-UsageRaw -Raw $api.raw -MeasuredAt $now)
     } else {
       # 실패 → 백오프 갱신. 캐시 유무와 무관하게 반드시 기록해야 최초 실행(dead token 등)에서도
       # 재시도가 폭주하지 않는다. 직전 백오프 "간격"(interval, deadline이 아님)을 이어받아야
@@ -264,7 +304,14 @@ function Get-ClaudeUsage {
         $script:UsageApiThrottleSec
       }
       $updated = if ($cache) { $cache } else { [pscustomobject]@{ fetchedAt = $null; raw = $null } }
-      $updated | Add-Member -NotePropertyName backoffUntil -NotePropertyValue ($now + $next) -Force
+      if ($api.failure) {
+        if (-not $api.failure.retryAt) { $api.failure.retryAt = $now + $next }
+        $updated | Add-Member -NotePropertyName failure -NotePropertyValue $api.failure -Force
+      }
+      # 서버가 Retry-After를 줬다면 로컬 백오프보다 이른 재호출을 하지 않는다.
+      $backoffUntil = $now + $next
+      if ($api.failure -and [int64]$api.failure.retryAt -gt $backoffUntil) { $backoffUntil = [int64]$api.failure.retryAt }
+      $updated | Add-Member -NotePropertyName backoffUntil -NotePropertyValue $backoffUntil -Force
       $updated | Add-Member -NotePropertyName backoffInterval -NotePropertyValue $next -Force
       Write-UsageCache $updated
       $cache = $updated
@@ -273,7 +320,13 @@ function Get-ClaudeUsage {
 
   # 캐시 폴백 (신선하든 오래됐든 — 오래됨은 measuredAt로 UI가 표시)
   if ($cache -and $cache.raw) {
-    return (ConvertFrom-UsageRaw -Raw $cache.raw -MeasuredAt ([int64]$cache.fetchedAt))
+    $usage = ConvertFrom-UsageRaw -Raw $cache.raw -MeasuredAt ([int64]$cache.fetchedAt)
+    if ($usage -and $cache.failure) { $usage | Add-Member -NotePropertyName refreshError -NotePropertyValue $cache.failure -Force }
+    return $usage
+  }
+  # 첫 호출부터 실패한 경우에도 상태 전용 객체를 반환해 메뉴/툴팁이 이유를 표시하게 한다.
+  if ($cache -and $cache.failure) {
+    return [pscustomobject]@{ measuredAt=$null; fiveHour=$null; weekly=$null; fable=$null; refreshError=$cache.failure }
   }
   return $null
 }
@@ -551,6 +604,7 @@ $script:GLYPH = @{
   '8'=@('0110','1001','0110','1001','1001','0110'); '9'=@('0110','1001','1001','0111','0001','0110')
   'C'=@('0110','1001','1000','1000','1001','0110'); 'X'=@('1001','1001','0110','0110','1001','1001')
   'W'=@('1001','1001','1001','1011','1111','0110'); 'F'=@('1111','1000','1110','1000','1000','1000')
+  '?'=@('0110','1001','0001','0010','0000','0010')
 }
 $script:GLYPH_W = 4; $script:GLYPH_H = 6
 
@@ -582,7 +636,7 @@ function Measure-PixelString { param([string]$Str) return ($Str.Length * ($scrip
 # 배터리 아이콘 하나를 Bitmap으로 렌더. remain=잔량%, tag=창 식별 글자(5/W/F), dark, size(정사각 px).
 #   가로 캡슐(테두리+좌측 채움) + 캡슐 안 잔량 2자리 숫자 + 좌상단 창 태그.
 function New-BatteryBitmap {
-  param([double]$Remain, [string]$Tag, [bool]$Dark, [int]$Size = 32)
+  param([double]$Remain, [string]$Tag, [bool]$Dark, [int]$Size = 32, [bool]$Stale = $false)
   $bmp = New-Object System.Drawing.Bitmap($Size, $Size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
   $g = $null; $ink = $null; $dkInk = $null; $fillBrush = $null
   try {
@@ -591,7 +645,9 @@ function New-BatteryBitmap {
     $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::None
     $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::Half
 
-    $inkColor = if ($Dark) { [Drawing.Color]::FromArgb(235,235,235) } else { [Drawing.Color]::FromArgb(45,45,45) }
+    # stale은 실제 100%가 아니라 리셋 후 미측정 상태다. 양 테마에서 선명한 경고색 외곽선과
+    # 빈 배터리 + '?'로 표현해 16px에서도 가득 찬 초록 배터리와 혼동되지 않게 한다.
+    $inkColor = if ($Stale) { if ($Dark) { [Drawing.Color]::FromArgb(255,214,10) } else { [Drawing.Color]::FromArgb(190,120,0) } } elseif ($Dark) { [Drawing.Color]::FromArgb(235,235,235) } else { [Drawing.Color]::FromArgb(45,45,45) }
     $ink   = New-Object System.Drawing.SolidBrush($inkColor)
     $dkInk = New-Object System.Drawing.SolidBrush([Drawing.Color]::FromArgb(30,30,30))
     $fillColor = Get-HeatColor -Remain $Remain -Dark $Dark
@@ -620,11 +676,12 @@ function New-BatteryBitmap {
     $innerW = $bw - 2 * $border; $innerH = $bh - 2 * $border
     $v = [math]::Max(0, [math]::Min(100, $Remain))
     $fw = [int][math]::Round(($v / 100) * $innerW)
-    if ($fw -gt 0) { $g.FillRectangle($fillBrush, $innerX, $innerY, $fw, $innerH) }
+    if (-not $Stale -and $fw -gt 0) { $g.FillRectangle($fillBrush, $innerX, $innerY, $fw, $innerH) }
+    if ($Stale) { $fw = 0 }
     $fillBoundaryLogical = [int][math]::Floor(($innerX + $fw) / $sc)
 
     # 잔량 숫자 (캡슐 안, 가운데). 채움 위 픽셀은 어두운 잉크, 빈 배경 위는 ink → 어디서나 대비.
-    $numStr = [string][int][math]::Round($v)
+    $numStr = if ($Stale) { '?' } else { [string][int][math]::Round($v) }
     $numWpx = (Measure-PixelString $numStr) * $sc
     $numXlogical = [int]([math]::Floor(($bx + ($bw - $numWpx)/2) / $sc))
     $numYlogical = [int]([math]::Floor(($by + ($bh - $script:GLYPH_H * $sc)/2) / $sc))
@@ -650,8 +707,8 @@ function New-BatteryBitmap {
 
 # Bitmap → [System.Drawing.Icon]. 반환 객체에 .Icon 과 해제용 .Handle 포함.
 function New-BatteryIcon {
-  param([double]$Remain, [string]$Tag, [bool]$Dark, [int]$Size = 32)
-  $bmp = New-BatteryBitmap -Remain $Remain -Tag $Tag -Dark $Dark -Size $Size
+  param([double]$Remain, [string]$Tag, [bool]$Dark, [int]$Size = 32, [bool]$Stale = $false)
+  $bmp = New-BatteryBitmap -Remain $Remain -Tag $Tag -Dark $Dark -Size $Size -Stale $Stale
   $hicon = [IntPtr]::Zero
   $icon = $null
   try {
@@ -688,15 +745,15 @@ function Get-BatteryItems {
   if ($Usage) {
     if ($Usage.fiveHour) {
       $r = [math]::Max(0, 100 - $Usage.fiveHour.pct)
-      $items += [pscustomobject]@{ key='C5'; tag='5'; remain=$r; service='claude'; tip=("Claude 5시간: {0}% 남음{1}" -f [int]$r, (& $resetTip $Usage.fiveHour.resetsAt)) }
+      $items += [pscustomobject]@{ key='C5'; tag='5'; remain=$r; stale=$false; service='claude'; tip=("Claude 5시간: {0}% 남음{1}" -f [int]$r, (& $resetTip $Usage.fiveHour.resetsAt)) }
     }
     if ($Usage.weekly) {
       $r = [math]::Max(0, 100 - $Usage.weekly.pct)
-      $items += [pscustomobject]@{ key='CW'; tag='W'; remain=$r; service='claude'; tip=("Claude 주간: {0}% 남음{1}" -f [int]$r, (& $resetTip $Usage.weekly.resetsAt)) }
+      $items += [pscustomobject]@{ key='CW'; tag='W'; remain=$r; stale=$false; service='claude'; tip=("Claude 주간: {0}% 남음{1}" -f [int]$r, (& $resetTip $Usage.weekly.resetsAt)) }
     }
     if ($Usage.fable) {
       $r = [math]::Max(0, 100 - $Usage.fable.pct)
-      $items += [pscustomobject]@{ key='CF'; tag='F'; remain=$r; service='claude'; tip=("Claude {0}: {1}% 남음{2}" -f $Usage.fable.model, [int]$r, (& $resetTip $Usage.fable.resetsAt)) }
+      $items += [pscustomobject]@{ key='CF'; tag='F'; remain=$r; stale=$false; service='claude'; tip=("Claude {0}: {1}% 남음{2}" -f $Usage.fable.model, [int]$r, (& $resetTip $Usage.fable.resetsAt)) }
     }
   }
   if ($Codex) {
@@ -707,19 +764,25 @@ function Get-BatteryItems {
         $r = [math]::Max(0, 100 - $p.pct)
         $tip = "Codex 5시간: {0}% 남음" -f [int]$r
         if ($p.stale) { $tip += ' · 리셋됨' } elseif ($p.resetsIn) { $tip += ' · 리셋 ' + (Format-Duration $p.resetsIn) }
-        $items += [pscustomobject]@{ key='X5'; tag='5'; remain=$r; service='codex'; tip=$tip }
+        $items += [pscustomobject]@{ key='X5'; tag='5'; remain=$r; stale=[bool]$p.stale; service='codex'; tip=$tip }
       }
       if ($s) {
         $r = [math]::Max(0, 100 - $s.pct)
         $tip = "Codex 주간: {0}% 남음" -f [int]$r
         if ($s.stale) { $tip += ' · 리셋됨' } elseif ($s.resetsIn) { $tip += ' · 리셋 ' + (Format-Duration $s.resetsIn) }
-        $items += [pscustomobject]@{ key='XW'; tag='W'; remain=$r; service='codex'; tip=$tip }
+        $items += [pscustomobject]@{ key='XW'; tag='W'; remain=$r; stale=[bool]$s.stale; service='codex'; tip=$tip }
       }
     } elseif ($Codex.credits) {
       $cr = $Codex.credits
       $remain = if ($cr.unlimited) { 100 } elseif ($cr.has_credits -and [double]$cr.balance -gt 0) { 100 } else { 0 }
       $tip = if ($cr.unlimited) { 'Codex 크레딧: 무제한' } elseif ($remain -gt 0) { "Codex 크레딧: 잔액 $($cr.balance)" } else { 'Codex 크레딧: 소진' }
-      $items += [pscustomobject]@{ key='X'; tag='X'; remain=$remain; service='codex'; tip=$tip }
+      $items += [pscustomobject]@{ key='X'; tag='X'; remain=$remain; stale=$false; service='codex'; tip=$tip }
+    }
+  }
+  if ($Usage -and $Usage.refreshError) {
+    $warning = Format-ClaudeFailure -Failure $Usage.refreshError -MeasuredAt $Usage.measuredAt
+    foreach ($it in $items) {
+      if ($it.service -eq 'claude') { $it.tip = $warning + ' · ' + $it.tip }
     }
   }
   # 콤마(,$items) 없이 반환 — 소비 측은 항상 @(...)로 감싸 배열 보장. 콤마는 다중 항목을 중첩시킴.
@@ -733,8 +796,9 @@ if ($RenderTest) {
   $outDir = if ($RenderOut) { $RenderOut } else { Join-Path $env:TEMP 'ccb-render' }
   if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
   $samples = @(
-    @{ tag='5'; remain=72 }, @{ tag='W'; remain=33 }, @{ tag='F'; remain=8 },
-    @{ tag='5'; remain=100 }, @{ tag='X'; remain=54 }, @{ tag='W'; remain=19 }
+    @{ tag='5'; remain=72; stale=$false }, @{ tag='W'; remain=33; stale=$false }, @{ tag='F'; remain=8; stale=$false },
+    @{ tag='5'; remain=100; stale=$false }, @{ tag='5'; remain=100; stale=$true },
+    @{ tag='X'; remain=54; stale=$false }, @{ tag='W'; remain=19; stale=$false }
   )
   # 크기별로 6개 샘플을 한 줄 스트립으로 (작업표시줄 유사 배경 위) — 현실적 가독성 판단용
   foreach ($dark in @($true,$false)) {
@@ -747,7 +811,7 @@ if ($RenderTest) {
       $sg.Clear($bg)
       $x = 0
       foreach ($sm in $samples) {
-        $b = New-BatteryBitmap -Remain $sm.remain -Tag $sm.tag -Dark $dark -Size $size
+        $b = New-BatteryBitmap -Remain $sm.remain -Tag $sm.tag -Dark $dark -Size $size -Stale $sm.stale
         $sg.DrawImage($b, $x, 0); $b.Dispose(); $x += $size + $gap
       }
       $sg.Dispose()
@@ -769,7 +833,7 @@ if ($RenderTest) {
       $sg.Clear($bg)
       $x = 0
       foreach ($it in $items) {
-        $b = New-BatteryBitmap -Remain $it.remain -Tag $it.tag -Dark $dark -Size $sz
+        $b = New-BatteryBitmap -Remain $it.remain -Tag $it.tag -Dark $dark -Size $sz -Stale $it.stale
         $sg.DrawImage($b, $x, 0); $b.Dispose(); $x += $sz + $gap
       }
       $sg.Dispose()
@@ -929,7 +993,8 @@ function Build-DetailMenu {
   $menu.ShowImageMargin = $false
   $gray = [Drawing.Color]::FromArgb(139,148,158)
 
-  $hasClaude = [bool]$Usage
+  $hasClaude = [bool]($Usage -and ($Usage.fiveHour -or $Usage.weekly -or $Usage.fable))
+  $claudeFailureText = if ($Usage -and $Usage.refreshError) { Format-ClaudeFailure -Failure $Usage.refreshError -MeasuredAt $Usage.measuredAt } else { '' }
   $hasCodex  = [bool]$Codex
 
   # 범례
@@ -939,7 +1004,7 @@ function Build-DetailMenu {
   if ($legend.Count) { Add-Label $menu ('🔋 남은 %  ·  ' + ($legend -join '  ·  ')) $gray $script:MONO_SM | Out-Null; $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null }
 
   # Claude 섹션
-  if ($hasClaude) {
+  if ($hasClaude -or $claudeFailureText) {
     Add-Label $menu 'Claude Code' $gray $script:MONO | Out-Null
     $winRow = {
       param($label, $w)
@@ -953,7 +1018,8 @@ function Build-DetailMenu {
     & $winRow '5시간 남음' $Usage.fiveHour
     & $winRow '주간 남음 ' $Usage.weekly
     if ($Usage.fable) { & $winRow ('{0} 남음' -f $Usage.fable.model) $Usage.fable }
-    Add-Label $menu ('측정 {0} 전 (Claude 실시간)' -f (Format-Duration ($now - $Usage.measuredAt))) $gray $script:MONO_SM | Out-Null
+    if ($Usage.measuredAt) { Add-Label $menu ('측정 {0} 전 (Claude 실시간)' -f (Format-Duration ($now - $Usage.measuredAt))) $gray $script:MONO_SM | Out-Null }
+    if ($claudeFailureText) { Add-Label $menu $claudeFailureText ([Drawing.Color]::FromArgb(210,153,34)) $script:MONO_SM | Out-Null }
     if ($Blocks -and -not $Blocks.error) {
       Add-Label $menu ('블록 비용  ${0:0.00}  ·  {1} 토큰' -f $Blocks.cost, (Format-Tokens $Blocks.tokens)) $gray $script:MONO_SM | Out-Null
     }
@@ -996,7 +1062,7 @@ function Build-DetailMenu {
     $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
   }
 
-  if (-not $hasClaude -and -not $hasCodex) {
+  if (-not $hasClaude -and -not $hasCodex -and -not $claudeFailureText) {
     Add-Label $menu 'Claude Code나 Codex를 실행하면 사용량이 표시됩니다' $gray $script:MONO_SM | Out-Null
     $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
   }
@@ -1130,10 +1196,11 @@ function Render-Tray {
     if ($items.Count -eq 0) {
       $bmp = New-PlaceholderBitmap -Dark $dark -Size $size
       $h = $bmp.GetHicon(); $ic = [System.Drawing.Icon]::FromHandle($h); $bmp.Dispose()
-      $newIcons += [pscustomobject]@{ Icon = $ic; Handle = $h; Tip = 'Claude Code나 Codex 실행 시 표시' }
+      $placeholderTip = if ($Usage -and $Usage.refreshError) { Format-ClaudeFailure -Failure $Usage.refreshError -MeasuredAt $Usage.measuredAt } else { 'Claude Code나 Codex 실행 시 표시' }
+      $newIcons += [pscustomobject]@{ Icon = $ic; Handle = $h; Tip = $placeholderTip }
     } else {
       foreach ($it in $items) {
-        $io = New-BatteryIcon -Remain $it.remain -Tag $it.tag -Dark $dark -Size $size
+        $io = New-BatteryIcon -Remain $it.remain -Tag $it.tag -Dark $dark -Size $size -Stale $it.stale
         $io | Add-Member -NotePropertyName Tip -NotePropertyValue $it.tip -Force
         $newIcons += $io
       }
@@ -1263,7 +1330,7 @@ if ($SelfTest) {
     $menu.Dispose()
     # NotifyIcon 생성/표시 없이 아이콘 객체만 검증
     $dark = Test-DarkMode
-    foreach ($it in $items) { $io = New-BatteryIcon -Remain $it.remain -Tag $it.tag -Dark $dark -Size 32; Remove-BatteryIcon $io }
+    foreach ($it in $items) { $io = New-BatteryIcon -Remain $it.remain -Tag $it.tag -Dark $dark -Size 32 -Stale $it.stale; Remove-BatteryIcon $io }
     Write-Host "SelfTest: 예외 없음 ✅"
   } catch { $err += $_; Write-Host ("SelfTest 실패: {0}" -f $_.Exception.Message) -ForegroundColor Red; Write-Host $_.ScriptStackTrace }
   return
