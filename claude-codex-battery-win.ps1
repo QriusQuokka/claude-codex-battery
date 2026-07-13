@@ -34,7 +34,7 @@ param(
 # ══════════════════════════════════════════════════════════════════
 #  CONFIG — 상단 상수 (사용자가 조정하는 지점)
 # ══════════════════════════════════════════════════════════════════
-$script:VERSION            = '1.1.0-win'              # 이 Windows 포트의 버전
+$script:VERSION            = '1.1.1-win'              # 이 Windows 포트의 버전
 $script:EnableUsageApi     = $true                    # ★ Claude 사용량 API 호출 on/off (프라이버시 opt-out 지점)
 $script:ClaudeUaVersion    = '2.1.206'                # User-Agent: claude-code/<이 값> (형식이 중요, 정확한 값은 무관)
 $script:UsageApiThrottleSec = 300                     # API 최소 호출 간격(초). 429 방지 — 렌더보다 훨씬 길게.
@@ -1174,12 +1174,39 @@ function Build-DetailMenu {
   $refresh = New-Object System.Windows.Forms.ToolStripMenuItem; $refresh.Text = '🔄 지금 새로고침'
   $refresh.Add_Click({ Update-Tray -Force }); $menu.Items.Add($refresh) | Out-Null
 
-  $auto = New-Object System.Windows.Forms.ToolStripMenuItem; $auto.Text = '시작 시 자동 실행'
-  $auto.Checked = (Test-Autostart); $auto.CheckOnClick = $true
-  $auto.Add_Click({ Set-Autostart -On ($this.Checked) | Out-Null }); $menu.Items.Add($auto) | Out-Null
+  $autoOn = Test-Autostart
+  $auto = New-Object System.Windows.Forms.ToolStripMenuItem
+  $auto.Text = 'Windows 로그인 시 자동 실행 ' + $(if ($autoOn) { '(켜짐)' } else { '(꺼짐)' })
+  $auto.ToolTipText = '클릭하면 Windows 로그인 후 트레이 앱 자동 실행을 켜거나 끕니다'
+  $auto.Add_Click({
+    param($sender,$e)
+    $turnOn = -not (Test-Autostart)
+    if (Set-Autostart -On $turnOn) {
+      $sender.Text = 'Windows 로그인 시 자동 실행 ' + $(if ($turnOn) { '(켜짐)' } else { '(꺼짐)' })
+    }
+  })
+  $menu.Items.Add($auto) | Out-Null
 
-  $quit = New-Object System.Windows.Forms.ToolStripMenuItem; $quit.Text = '종료'
+  $close = New-Object System.Windows.Forms.ToolStripMenuItem; $close.Text = '메뉴 닫기'
+  $close.Add_Click({ param($sender,$e) if ($sender.Owner) { $sender.Owner.Close() } })
+  $menu.Items.Add($close) | Out-Null
+
+  $quit = New-Object System.Windows.Forms.ToolStripMenuItem; $quit.Text = '트레이 앱 완전히 종료'
   $quit.Add_Click({ Stop-ResidentTray }); $menu.Items.Add($quit) | Out-Null
+
+  $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
+
+  $github = New-Object System.Windows.Forms.ToolStripMenuItem
+  $github.Text = 'GitHub 저장소'
+  $github.ToolTipText = '프로젝트 GitHub 저장소를 기본 브라우저에서 엽니다'
+  $github.Add_Click({ try { Start-Process 'https://github.com/QriusQuokka/claude-codex-battery' } catch {} })
+  $menu.Items.Add($github) | Out-Null
+
+  $blog = New-Object System.Windows.Forms.ToolStripMenuItem
+  $blog.Text = '📝 개발 블로그'
+  $blog.ToolTipText = '개발 블로그 글을 기본 브라우저에서 엽니다'
+  $blog.Add_Click({ try { Start-Process 'https://qriusquokka.github.io/posts/claude-codex-battery-win/' } catch {} })
+  $menu.Items.Add($blog) | Out-Null
 
   $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
   Add-Label $menu ('v{0}  ·  Claude & Codex Usage Battery' -f $script:VERSION) $gray $script:MONO_SM | Out-Null
