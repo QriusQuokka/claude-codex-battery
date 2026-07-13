@@ -104,6 +104,48 @@ function Find-Bin {
   return $null   # 없음 — 호출부에서 우아하게 축소
 }
 
+# 외부 프로세스를 타임아웃과 함께 실행하고 표준출력을 반환. 시간 초과 시 프로세스를 죽이고 $null 반환.
+# ccusage 같은 선택 의존 바이너리(npm .cmd shim → Node 콜드스타트)가 무한정 걸리는 것을 방지.
+function Invoke-ExternalCommand {
+  param([string]$FilePath, [string[]]$ArgumentList = @(), [int]$TimeoutMs = 10000)
+  if (-not $FilePath) { return $null }
+  try {
+    $quote = { param($s) if ($s -match '[\s"]') { '"' + ($s -replace '"', '\"') + '"' } else { $s } }
+    $argStr = (($ArgumentList | ForEach-Object { & $quote $_ }) -join ' ')
+    $ext = [System.IO.Path]::GetExtension($FilePath)
+    if ($ext) { $ext = $ext.ToLowerInvariant() }
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    if ($ext -eq '.cmd' -or $ext -eq '.bat') {
+      # .cmd/.bat shim(npm 글로벌 설치)은 cmd.exe를 통해야 함 — 직접 실행하면 Win32Exception.
+      $psi.FileName = (Join-Path $env:SystemRoot 'System32\cmd.exe')
+      $psi.Arguments = '/d /c ""{0}" {1}"' -f $FilePath, $argStr
+    } elseif ($ext -eq '.ps1') {
+      $psi.FileName = (Join-Path $PSHOME 'powershell.exe')
+      $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" {1}' -f $FilePath, $argStr
+    } else {
+      $psi.FileName = $FilePath
+      $psi.Arguments = $argStr
+    }
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError  = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow  = $true
+    $p = New-Object System.Diagnostics.Process
+    $p.StartInfo = $psi
+    [void]$p.Start()
+    $outTask = $p.StandardOutput.ReadToEndAsync()
+    [void]$p.StandardError.ReadToEndAsync()   # 버퍼 적체로 인한 데드락 방지 — 반드시 소비
+    if (-not $p.WaitForExit($TimeoutMs)) {
+      try { $p.Kill() } catch {}
+      try { $p.Dispose() } catch {}
+      return $null
+    }
+    $out = $outTask.GetAwaiter().GetResult()
+    try { $p.Dispose() } catch {}
+    return $out
+  } catch { return $null }
+}
+
 # ══════════════════════════════════════════════════════════════════
 #  1. Claude 사용량 (OAuth usage API + 로컬 캐시 + 스로틀)
 #     Phase 0 결과: 로컬 usage-cache 없음 → API가 주 소스.
@@ -215,22 +257,37 @@ function Get-CodexSessionsDir {
   return (Join-Path $script:HOME_DIR '.codex\sessions')
 }
 
-function Get-CodexUsage {
-  $dir = Get-CodexSessionsDir
-  if (-not (Test-Path $dir)) { return $null }
-  $files = @()
+# 파일 꼬리에서 최대 MaxBytes만 읽음 — 세션 로그 전체를 메모리에 올리지 않기 위함(누적 세션 길이에 비례한 비용 방지).
+function Read-TailText {
+  param([string]$Path, [int64]$MaxBytes = 131072)
   try {
-    $files = Get-ChildItem $dir -Recurse -Filter *.jsonl -File -ErrorAction SilentlyContinue |
-             Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 8
+    $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+    try {
+      $len = $fs.Length
+      $take = [Math]::Min($MaxBytes, $len)
+      if ($take -le 0) { return '' }
+      $fs.Seek(-$take, [System.IO.SeekOrigin]::End) | Out-Null
+      $buf = New-Object byte[] $take
+      $readTotal = 0
+      while ($readTotal -lt $take) {
+        $n = $fs.Read($buf, $readTotal, $take - $readTotal)
+        if ($n -le 0) { break }
+        $readTotal += $n
+      }
+      return [System.Text.Encoding]::UTF8.GetString($buf, 0, $readTotal)
+    } finally { $fs.Dispose() }
   } catch { return $null }
-  foreach ($f in $files) {
-    # line-mode Get-Content는 함수 스코프에서 빈 결과를 내는 PS 5.1 기벽이 있어 -Raw로 읽고 직접 분할.
-    # 대용량 세션 로그·BOM에도 이 방식이 더 견고하다.
-    $content = $null
-    try { $content = Get-Content $f.FullName -Raw -Encoding UTF8 -ErrorAction Stop } catch { continue }
-    if ([string]::IsNullOrEmpty($content)) { continue }
-    $content = $content.TrimStart([char]0xFEFF)   # 혹시 남은 UTF-8 BOM 제거
-    $lines = @($content -split "`r?`n")
+}
+
+# 파일 하나에서 최신 rate_limits 라인을 찾음. 꼬리부터 점증 탐색(128K→512K→2M) — 전체 파일을 읽지 않음.
+function Find-RateLimitsInFile {
+  param([string]$Path)
+  foreach ($capBytes in 131072, 524288, 2097152) {
+    $text = Read-TailText -Path $Path -MaxBytes $capBytes
+    if ([string]::IsNullOrEmpty($text)) { return $null }
+    $full = ($text.Length -lt $capBytes)   # 파일 전체를 이미 다 읽었으면 더 키워도 무의미
+    $text = $text.TrimStart([char]0xFEFF)  # 혹시 남은 UTF-8 BOM 제거
+    $lines = @($text -split "`r?`n")
     for ($i = $lines.Count - 1; $i -ge 0; $i--) {
       if ($lines[$i] -notmatch 'rate_limits') { continue }
       $obj = $null
@@ -238,15 +295,47 @@ function Get-CodexUsage {
       $rl = $null
       if ($obj.payload -and $obj.payload.rate_limits) { $rl = $obj.payload.rate_limits }
       elseif ($obj.rate_limits) { $rl = $obj.rate_limits }
-      if ($rl -and ($rl.primary -or $rl.secondary -or $rl.credits)) {
-        return [pscustomobject]@{
-          measuredAt = [int64]([DateTimeOffset]::new($f.LastWriteTimeUtc, [TimeSpan]::Zero).ToUnixTimeSeconds())
-          limitId    = $rl.limit_id
-          plan       = $rl.plan_type
-          primary    = $rl.primary
-          secondary  = $rl.secondary
-          credits    = $rl.credits
-        }
+      if ($rl -and ($rl.primary -or $rl.secondary -or $rl.credits)) { return $rl }
+    }
+    if ($full) { return $null }
+  }
+  return $null
+}
+
+function Get-CodexUsage {
+  $dir = Get-CodexSessionsDir
+  if (-not (Test-Path $dir)) { return $null }
+  $files = @()
+  try {
+    # Codex는 세션을 <sessions>/YYYY/MM/DD/rollout-*.jsonl 로 날짜 파티션한다.
+    # 오늘/어제 폴더만 훑어 매 틱 전체 트리를 재귀 나열하는 비용(전체 세션 이력에 비례)을 피한다.
+    $today = Get-Date
+    $dayDirs = @()
+    foreach ($d in @($today, $today.AddDays(-1))) {
+      $p = Join-Path (Join-Path (Join-Path $dir $d.ToString('yyyy')) $d.ToString('MM')) $d.ToString('dd')
+      if (Test-Path $p) { $dayDirs += $p }
+    }
+    if ($dayDirs.Count -gt 0) {
+      foreach ($dd in $dayDirs) {
+        $files += Get-ChildItem $dd -Filter *.jsonl -File -ErrorAction SilentlyContinue
+      }
+      $files = $files | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 8
+    } else {
+      # 예상 밖 레이아웃 폴백 — 기존처럼 전체 재귀
+      $files = Get-ChildItem $dir -Recurse -Filter *.jsonl -File -ErrorAction SilentlyContinue |
+               Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 8
+    }
+  } catch { return $null }
+  foreach ($f in $files) {
+    $rl = Find-RateLimitsInFile -Path $f.FullName
+    if ($rl) {
+      return [pscustomobject]@{
+        measuredAt = [int64]([DateTimeOffset]::new($f.LastWriteTimeUtc, [TimeSpan]::Zero).ToUnixTimeSeconds())
+        limitId    = $rl.limit_id
+        plan       = $rl.plan_type
+        primary    = $rl.primary
+        secondary  = $rl.secondary
+        credits    = $rl.credits
       }
     }
   }
@@ -311,7 +400,8 @@ function Get-ClaudeBlocks {
   $bin = Get-CcusageBin
   if (-not $bin) { return $null }
   try {
-    $raw = & $bin blocks --active --json 2>$null | Out-String
+    $raw = Invoke-ExternalCommand -FilePath $bin -ArgumentList @('blocks', '--active', '--json') -TimeoutMs 10000
+    if (-not $raw) { return $null }   # 타임아웃/무응답 — 다음 틱에 재시도, 트레이는 막지 않음
     $data = $raw | ConvertFrom-Json
     $b = $null
     if ($data.blocks) { $b = $data.blocks | Where-Object { $_.isActive } | Select-Object -First 1; if (-not $b) { $b = $data.blocks[0] } }
@@ -345,7 +435,8 @@ function Get-ClaudeModels {
   if (-not $bin) { return $null }
   try {
     $ymd = (Get-Date).ToString('yyyyMMdd')
-    $raw = & $bin daily --breakdown --json --since $ymd 2>$null | Out-String
+    $raw = Invoke-ExternalCommand -FilePath $bin -ArgumentList @('daily', '--breakdown', '--json', '--since', $ymd) -TimeoutMs 10000
+    if (-not $raw) { return $null }   # 타임아웃/무응답 — 다음 틱에 재시도, 트레이는 막지 않음
     $day = ($raw | ConvertFrom-Json).daily | Select-Object -Last 1
     if (-not $day) { return $null }
     $models = @()
@@ -857,7 +948,7 @@ function Build-DetailMenu {
     $age = $now - $Codex.measuredAt
     $staleWarn = $age -gt 3*3600
     $warnTxt = if ($staleWarn) { '  ·  ⚠ 리셋됐을 수 있음, Codex 쓰면 갱신' } else { ' (Codex 세션 기준)' }
-    Add-Label $menu ('측정 {0} 전{1}' -f (Format-Duration $age), $warnTxt) (if ($staleWarn) { [Drawing.Color]::FromArgb(210,153,34) } else { $gray }) $script:MONO_SM | Out-Null
+    Add-Label $menu ('측정 {0} 전{1}' -f (Format-Duration $age), $warnTxt) $(if ($staleWarn) { [Drawing.Color]::FromArgb(210,153,34) } else { $gray }) $script:MONO_SM | Out-Null
     $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
   }
 
@@ -896,7 +987,70 @@ function Build-DetailMenu {
 # ══════════════════════════════════════════════════════════════════
 #  Phase 4 — 상주 트레이 관리
 # ══════════════════════════════════════════════════════════════════
-$script:Tray = @{ NIs = @(); IconObjs = @(); Menu = $null; Timer = $null; Mutex = $null }
+$script:Tray = @{
+  NIs = @(); IconObjs = @(); Menu = $null; Timer = $null; PollTimer = $null; Mutex = $null
+  Cache = @{ Usage = $null; Codex = $null; Models = $null; Blocks = $null; FetchedAt = 0 }
+  Fetch = @{ PS = $null; Runspace = $null; Handle = $null; InFlight = $false }
+}
+
+# 네 가지 데이터 조회(Get-ClaudeUsage/Get-CodexUsage/Get-ClaudeModels/Get-ClaudeBlocks)를
+# 별도 러너스페이스(스레드)에서 비동기로 시작. UI 스레드는 절대 블로킹하지 않는다.
+# 이미 진행 중인 조회가 있으면 새로 시작하지 않음(중첩 방지 — hung ccusage가 있어도 쌓이지 않게).
+function Start-DataFetch {
+  param([switch]$ForceApi)
+  if ($script:Tray.Fetch.InFlight) { return }
+  if (-not $script:SELF_PATH) { return }
+  try {
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.Open()
+    $ps = [powershell]::Create()
+    $ps.Runspace = $rs
+    [void]$ps.AddScript({
+      param($SelfPath, $ForceApi)
+      . $SelfPath   # 스위치 없이 dot-source — 함수 정의만 로드되고 -Run 등 부수효과는 실행되지 않음
+      [pscustomobject]@{
+        Usage  = (Get-ClaudeUsage -Force:$ForceApi)
+        Codex  = (Get-CodexUsage)
+        Models = (Get-ClaudeModels)
+        Blocks = (Get-ClaudeBlocks)
+      }
+    }).AddArgument($script:SELF_PATH).AddArgument([bool]$ForceApi)
+    $handle = $ps.BeginInvoke()
+    $script:Tray.Fetch.PS = $ps
+    $script:Tray.Fetch.Runspace = $rs
+    $script:Tray.Fetch.Handle = $handle
+    $script:Tray.Fetch.InFlight = $true
+  } catch {
+    $script:Tray.Fetch.InFlight = $false   # 시작 실패 — 캐시(플레이스홀더 포함)는 유지, 다음 틱에 재시도
+  }
+}
+
+# 완료된 백그라운드 조회가 있으면 결과를 캐시로 수확하고 러너스페이스를 정리. 반환값 true=새 데이터 반영됨.
+# UI 스레드에서 호출하되, 여기서 하는 일은 상태 확인 + 값 복사뿐이라 블로킹하지 않는다.
+function Complete-DataFetch {
+  $fx = $script:Tray.Fetch
+  if (-not $fx.InFlight -or -not $fx.Handle) { return $false }
+  if (-not $fx.Handle.IsCompleted) { return $false }
+  $got = $false
+  try {
+    $result = $fx.PS.EndInvoke($fx.Handle)
+    if ($result -and $result.Count -gt 0 -and $result[0]) {
+      $r = $result[0]
+      $script:Tray.Cache.Usage     = $r.Usage
+      $script:Tray.Cache.Codex     = $r.Codex
+      $script:Tray.Cache.Models    = $r.Models
+      $script:Tray.Cache.Blocks    = $r.Blocks
+      $script:Tray.Cache.FetchedAt = Get-UnixNow
+      $got = $true
+    }
+  } catch {
+  } finally {
+    try { $fx.PS.Dispose() } catch {}
+    try { $fx.Runspace.Close(); $fx.Runspace.Dispose() } catch {}
+    $script:Tray.Fetch = @{ PS = $null; Runspace = $null; Handle = $null; InFlight = $false }
+  }
+  return $got
+}
 
 function New-PlaceholderBitmap {
   param([bool]$Dark, [int]$Size = 32)
@@ -912,19 +1066,14 @@ function New-PlaceholderBitmap {
   $ink.Dispose(); $g.Dispose(); return $bmp
 }
 
-function Update-Tray {
-  param([switch]$Force)
+# 순수 렌더링만 수행(네트워크/프로세스/파일 조회 없음) — 항상 UI 스레드에서, 항상 캐시된 데이터로 호출.
+function Render-Tray {
+  param($Usage, $Codex, $Models, $Blocks)
   try {
-    $usage = Get-ClaudeUsage -Force:$Force
-    $codex = Get-CodexUsage
-    $models = Get-ClaudeModels
-    $blocks = Get-ClaudeBlocks
-    Invoke-CodexAutoRefresh $codex
-    Start-UpdateCheck
     $dark = Test-DarkMode
     $size = try { [System.Windows.Forms.SystemInformation]::SmallIconSize.Height } catch { 16 }
     if ($size -lt 16) { $size = 16 }
-    $items = @(Get-BatteryItems -Usage $usage -Codex $codex)
+    $items = @(Get-BatteryItems -Usage $Usage -Codex $Codex)
 
     # 새 아이콘 준비 (없으면 placeholder 1개)
     $newIcons = @()
@@ -953,7 +1102,7 @@ function Update-Tray {
 
     # 메뉴 재구성 (이전 것 정리)
     $oldMenu = $script:Tray.Menu
-    $script:Tray.Menu = Build-DetailMenu -Usage $usage -Codex $codex -Models $models -Blocks $blocks
+    $script:Tray.Menu = Build-DetailMenu -Usage $Usage -Codex $Codex -Models $Models -Blocks $Blocks
 
     # 아이콘/툴팁 적용 + 이전 아이콘 핸들 해제
     for ($i = 0; $i -lt $newIcons.Count; $i++) {
@@ -972,11 +1121,34 @@ function Update-Tray {
   }
 }
 
+# 메인 타이머(120초) 틱: 완료된 조회를 수확 → 캐시로 즉시 렌더(블로킹 없음) → 다음 조회를 백그라운드로 시작.
+# 콜드 스타트에도 첫 렌더는 캐시(비어있으면 placeholder)로 즉시 그려지고, 실제 데이터는 폴 타이머가 반영한다.
+function Update-Tray {
+  param([switch]$Force)
+  [void](Complete-DataFetch)
+  if (-not $script:Tray.Fetch.InFlight) { Start-DataFetch -ForceApi:$Force }
+  Render-Tray -Usage $script:Tray.Cache.Usage -Codex $script:Tray.Cache.Codex -Models $script:Tray.Cache.Models -Blocks $script:Tray.Cache.Blocks
+  Invoke-CodexAutoRefresh $script:Tray.Cache.Codex
+  Start-UpdateCheck
+}
+
+# 짧은 주기(2초) 폴 타이머 틱: 백그라운드 조회가 끝났는지만 값싸게 확인하고, 끝났을 때만 재렌더.
+# 새 조회는 시작하지 않는다(그건 메인 타이머/새로고침 버튼의 몫) — 순수 폴링이라 UI를 절대 막지 않음.
+function Poll-TrayFetch {
+  if (Complete-DataFetch) {
+    Render-Tray -Usage $script:Tray.Cache.Usage -Codex $script:Tray.Cache.Codex -Models $script:Tray.Cache.Models -Blocks $script:Tray.Cache.Blocks
+  }
+}
+
 function Stop-ResidentTray {
   try { if ($script:Tray.Timer) { $script:Tray.Timer.Stop() } } catch {}
+  try { if ($script:Tray.PollTimer) { $script:Tray.PollTimer.Stop() } } catch {}
   foreach ($ni in $script:Tray.NIs) { try { $ni.Visible = $false; $ni.Dispose() } catch {} }
   foreach ($io in $script:Tray.IconObjs) { Remove-BatteryIcon $io }
   try { if ($script:Tray.Menu) { $script:Tray.Menu.Dispose() } } catch {}
+  # 진행 중인 백그라운드 조회가 있으면 정리 (종료 시 러너스페이스가 남지 않도록)
+  try { if ($script:Tray.Fetch.Runspace) { $script:Tray.Fetch.Runspace.Close(); $script:Tray.Fetch.Runspace.Dispose() } } catch {}
+  try { if ($script:Tray.Fetch.PS) { $script:Tray.Fetch.PS.Dispose() } } catch {}
   [System.Windows.Forms.Application]::Exit()
 }
 
@@ -988,10 +1160,14 @@ function Start-ResidentTray {
   Ensure-AppData
   [System.Windows.Forms.Application]::EnableVisualStyles()
   $script:Tray.Timer = New-Object System.Windows.Forms.Timer
-  $script:Tray.Timer.Interval = 120000   # 2분
+  $script:Tray.Timer.Interval = 120000   # 2분 — 조회 시작 + 캐시로부터 렌더 (블로킹 없음)
   $script:Tray.Timer.Add_Tick({ Update-Tray })
-  Update-Tray          # 초기 렌더
+  $script:Tray.PollTimer = New-Object System.Windows.Forms.Timer
+  $script:Tray.PollTimer.Interval = 2000   # 2초 — 백그라운드 조회 완료를 값싸게 확인해 빠르게 반영
+  $script:Tray.PollTimer.Add_Tick({ Poll-TrayFetch })
+  Update-Tray          # 초기 렌더 — 캐시가 비어도 즉시 placeholder를 보여주고, 조회는 백그라운드로 시작됨
   $script:Tray.Timer.Start()
+  $script:Tray.PollTimer.Start()
   [System.Windows.Forms.Application]::Run()
   # 종료 정리
   try { $script:Tray.Mutex.ReleaseMutex() } catch {}
