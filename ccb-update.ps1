@@ -16,8 +16,11 @@ function Read-LocalVersion {
   return '0.0.0'
 }
 function Compare-Ver { param($A,$B)
-  $pa=($A -replace '[^0-9.]','').Split('.'); $pb=($B -replace '[^0-9.]','').Split('.')
-  for($i=0;$i -lt 3;$i++){ $x=if($i -lt $pa.Count -and $pa[$i]){[int]$pa[$i]}else{0}; $y=if($i -lt $pb.Count -and $pb[$i]){[int]$pb[$i]}else{0}; if($x -gt $y){return 1}; if($x -lt $y){return -1} }
+  $parse={param($v);$text=if($null -eq $v){''}else{([string]$v).Trim()};$m=[regex]::Match($text,'^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?');if(-not $m.Success){return [pscustomobject]@{core=@(0,0,0);pre=''}};[pscustomobject]@{core=@(for($j=1;$j -le 3;$j++){if($m.Groups[$j].Success){[int64]$m.Groups[$j].Value}else{0}});pre=if($m.Groups[4].Success){$m.Groups[4].Value}else{''}}}
+  $pa=& $parse $A; $pb=& $parse $B
+  for($i=0;$i -lt 3;$i++){ $x=$pa.core[$i]; $y=$pb.core[$i]; if($x -gt $y){return 1}; if($x -lt $y){return -1} }
+  if(-not $pa.pre -and $pb.pre){return 1}; if($pa.pre -and -not $pb.pre){return -1}
+  if($pa.pre -ne $pb.pre){return [math]::Sign([string]::Compare($pa.pre,$pb.pre,[StringComparison]::OrdinalIgnoreCase))}
   return 0
 }
 
@@ -46,15 +49,17 @@ if (-not $allOk) {
   return
 }
 
-# 받은 메인 스크립트가 최소한 파싱은 되는지 확인 (실행하지 않고 구문만 검사).
-# 깨진 스크립트를 커밋하면 트레이가 그냥 사라지고 사용자는 아무 신호도 못 받는다 — 그 전에 걸러낸다.
-$newMain = Join-Path $tmp 'claude-codex-battery-win.ps1'
-$parseErrors = $null
-[System.Management.Automation.Language.Parser]::ParseFile($newMain, [ref]$null, [ref]$parseErrors) | Out-Null
-if ($parseErrors -and $parseErrors.Count -gt 0) {
-  Write-Host "⚠ 새로 받은 메인 스크립트가 파싱되지 않습니다 — 업데이트를 중단합니다 (기존 상태 유지)." -ForegroundColor Red
-  Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
-  return
+# 받은 PowerShell 스크립트 모두를 실행 전에 파싱한다. 업데이터 자신이 깨진 배포도 설치하지 않아
+# 다음 업데이트 경로가 영구히 막히는 일을 방지한다.
+foreach ($scriptName in @('claude-codex-battery-win.ps1','ccb-update.ps1')) {
+  $newScript = Join-Path $tmp $scriptName
+  $parseErrors = $null
+  [System.Management.Automation.Language.Parser]::ParseFile($newScript, [ref]$null, [ref]$parseErrors) | Out-Null
+  if ($parseErrors -and $parseErrors.Count -gt 0) {
+    Write-Host ("⚠ 새로 받은 {0} 파일이 파싱되지 않습니다 — 업데이트를 중단합니다 (기존 상태 유지)." -f $scriptName) -ForegroundColor Red
+    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    return
+  }
 }
 
 # 실행 중인 인스턴스 중지 (명령줄에 이 스크립트 경로 + -Run 포함하는 powershell)

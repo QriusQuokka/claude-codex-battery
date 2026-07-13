@@ -195,7 +195,23 @@ function Read-UsageCache {
 function Write-UsageCache {
   param($Obj)
   Ensure-AppData
-  try { ($Obj | ConvertTo-Json -Depth 12 -Compress) | Set-Content -Path $script:USAGE_CACHE -Encoding UTF8 } catch {}
+  $tmp = $script:USAGE_CACHE + '.' + [guid]::NewGuid().ToString('N') + '.tmp'
+  $bak = $tmp + '.bak'
+  try {
+    $json = $Obj | ConvertTo-Json -Depth 12 -Compress
+    [System.IO.File]::WriteAllText($tmp, $json, (New-Object System.Text.UTF8Encoding($false)))
+    if (Test-Path $script:USAGE_CACHE) {
+      # 같은 볼륨의 File.Replace는 독자가 중간 JSON을 볼 틈 없이 원자적으로 교체한다.
+      # .NET Framework(PS 5.1)의 File.Replace는 backupFileName=$null을 허용하지 않는다.
+      [System.IO.File]::Replace($tmp, $script:USAGE_CACHE, $bak, $true)
+      try { Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue } catch {}
+    } else {
+      [System.IO.File]::Move($tmp, $script:USAGE_CACHE)
+    }
+  } catch {
+    try { if (Test-Path $tmp) { Remove-Item -LiteralPath $tmp -Force } } catch {}
+    try { if (Test-Path $bak) { Remove-Item -LiteralPath $bak -Force } } catch {}
+  }
 }
 
 # API 1회 호출 — 항상 { ok, raw, failure } 반환 (절대 throw 안 함).
@@ -472,9 +488,16 @@ function Invoke-CodexAutoRefresh {
 #  3. ccusage (선택 의존) — 블록 비용 / 오늘 모델별. 없으면 $null.
 # ══════════════════════════════════════════════════════════════════
 $script:CCUSAGE_BIN = $null
+$script:CCUSAGE_BIN_CHECKED_AT = 0
 function Get-CcusageBin {
-  if ($null -eq $script:CCUSAGE_BIN) { $script:CCUSAGE_BIN = @(Find-Bin 'ccusage'); if (-not $script:CCUSAGE_BIN[0]) { $script:CCUSAGE_BIN = @('') } }
-  if ($script:CCUSAGE_BIN[0]) { return $script:CCUSAGE_BIN[0] } else { return $null }
+  $now = Get-UnixNow
+  $cachedMissing = (-not $script:CCUSAGE_BIN)
+  $cachedGone = ($script:CCUSAGE_BIN -and -not (Test-Path $script:CCUSAGE_BIN))
+  if ($script:CCUSAGE_BIN_CHECKED_AT -eq 0 -or $cachedGone -or ($cachedMissing -and ($now - $script:CCUSAGE_BIN_CHECKED_AT) -ge 600)) {
+    $script:CCUSAGE_BIN = Find-Bin 'ccusage'
+    $script:CCUSAGE_BIN_CHECKED_AT = $now
+  }
+  return $script:CCUSAGE_BIN
 }
 
 # 활성 5시간 블록 (비용/토큰/번레이트) — 원본 getClaude 이식
@@ -934,12 +957,24 @@ $script:UPDATE_CACHE = Join-Path $script:APP_DATA '.update-check.json'
 $script:REPO_RAW = 'https://raw.githubusercontent.com/QriusQuokka/claude-codex-battery/main'
 function Compare-Version {
   param([string]$A, [string]$B)
-  $pa = ($A -replace '[^0-9.]','').Split('.'); $pb = ($B -replace '[^0-9.]','').Split('.')
+  $parse = {
+    param([string]$v)
+    $text = if ($null -eq $v) { '' } else { $v.Trim() }
+    $m = [regex]::Match($text, '^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:-([0-9A-Za-z.-]+))?')
+    if (-not $m.Success) { return [pscustomobject]@{ core=@(0,0,0); pre='' } }
+    return [pscustomobject]@{
+      core = @(for ($j=1; $j -le 3; $j++) { if ($m.Groups[$j].Success) { [int64]$m.Groups[$j].Value } else { 0 } })
+      pre = if ($m.Groups[4].Success) { $m.Groups[4].Value } else { '' }
+    }
+  }
+  $pa = & $parse $A; $pb = & $parse $B
   for ($i = 0; $i -lt 3; $i++) {
-    $x = if ($i -lt $pa.Count -and $pa[$i]) { [int]$pa[$i] } else { 0 }
-    $y = if ($i -lt $pb.Count -and $pb[$i]) { [int]$pb[$i] } else { 0 }
+    $x = $pa.core[$i]; $y = $pb.core[$i]
     if ($x -gt $y) { return 1 }; if ($x -lt $y) { return -1 }
   }
+  if (-not $pa.pre -and $pb.pre) { return 1 }
+  if ($pa.pre -and -not $pb.pre) { return -1 }
+  if ($pa.pre -ne $pb.pre) { return [math]::Sign([string]::Compare($pa.pre, $pb.pre, [StringComparison]::OrdinalIgnoreCase)) }
   return 0
 }
 # 캐시만 읽어 업데이트 여부 반환 (네트워크 없음 — UI 스레드에서 매번 호출해도 안전)
@@ -979,6 +1014,7 @@ function Add-Label {
   param($Menu, [string]$Text, $Color, $Font)
   $it = New-Object System.Windows.Forms.ToolStripMenuItem
   $it.Text = $Text
+  $it.Enabled = $false
   if ($Color) { $it.ForeColor = $Color }
   $it.Font = if ($Font) { $Font } else { $script:MONO }
   $Menu.Items.Add($it) | Out-Null
