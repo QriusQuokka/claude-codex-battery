@@ -452,11 +452,66 @@ function Get-CodexWindowState {
   [pscustomobject]@{ pct = $pct; resetsIn = $resetsIn; stale = $stale }
 }
 
+# Codex 자동 갱신 프로세스는 UI 스레드에서 기다리지 않고 추적만 한다. 5분을 넘기면 다음 틱에 종료해
+# 멈춘 codex가 고아 프로세스로 남지 않게 한다.
+$script:CodexRefreshProcess = $null
+$script:CodexRefreshStartedAt = 0
+function Clear-CodexRefreshProcess {
+  param([switch]$Force)
+  $p = $script:CodexRefreshProcess
+  if (-not $p) { return $false }
+  $done = $false
+  try { $done = $p.HasExited } catch { $done = $true }
+  $expired = ($script:CodexRefreshStartedAt -and ((Get-UnixNow) - $script:CodexRefreshStartedAt -ge 300))
+  if (-not $done -and -not $Force -and -not $expired) { return $true }
+  if (-not $done) {
+    # .cmd npm shim 아래의 node 자식까지 함께 종료한다. 부모 cmd만 Kill하면 node가 고아로 남는다.
+    try {
+      $killer = Join-Path $env:SystemRoot 'System32\taskkill.exe'
+      $kp = Start-Process -FilePath $killer -ArgumentList '/PID',([string]$p.Id),'/T','/F' -WindowStyle Hidden -PassThru -Wait
+      $kp.Dispose()
+    } catch { try { $p.Kill() } catch {} }
+  }
+  try { $p.Dispose() } catch {}
+  $script:CodexRefreshProcess = $null
+  $script:CodexRefreshStartedAt = 0
+  return $false
+}
+
+function Start-CodexRefreshProcess {
+  param([string]$FilePath)
+  if (-not $FilePath) { return $null }
+  try {
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $ext = [System.IO.Path]::GetExtension($FilePath).ToLowerInvariant()
+    if ($ext -eq '.cmd' -or $ext -eq '.bat') {
+      $psi.FileName = Join-Path $env:SystemRoot 'System32\cmd.exe'
+      $psi.Arguments = '/d /c ""{0}" exec --sandbox read-only --skip-git-repo-check -"' -f $FilePath
+    } elseif ($ext -eq '.ps1') {
+      $psi.FileName = Join-Path $PSHOME 'powershell.exe'
+      $psi.Arguments = '-NoProfile -ExecutionPolicy Bypass -File "{0}" exec --sandbox read-only --skip-git-repo-check -' -f $FilePath
+    } else {
+      $psi.FileName = $FilePath
+      $psi.Arguments = 'exec --sandbox read-only --skip-git-repo-check -'
+    }
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
+    $psi.RedirectStandardInput = $true
+    $p = New-Object System.Diagnostics.Process
+    $p.StartInfo = $psi
+    if (-not $p.Start()) { $p.Dispose(); return $null }
+    $p.StandardInput.WriteLine('reply ok')
+    $p.StandardInput.Close()
+    return $p
+  } catch { return $null }
+}
+
 # 소진 + 오래됨일 때만 백그라운드로 Codex를 굴려 리셋 감지 (원본 maybeAutoRefreshCodex 이식).
 # 기본 off($script:CodexAutoRefresh=$false) — 토큰 소모를 원치 않으면 그대로 둠. 6h 스로틀.
 function Invoke-CodexAutoRefresh {
   param($Codex)
   try {
+    if (Clear-CodexRefreshProcess) { return }
     if (-not $script:CodexAutoRefresh) { return }
     if (-not $Codex) { return }
     $now = Get-UnixNow
@@ -475,12 +530,14 @@ function Invoke-CodexAutoRefresh {
     $last = 0
     if (Test-Path $tsFile) { try { $last = [int64]((Get-Content $tsFile -Raw).Trim()) } catch {} }
     if (($now - $last) -lt 6*3600) { return }               # 6h 스로틀 (하루 최대 4회)
-    Ensure-AppData
-    Set-Content -Path $tsFile -Value ([string]$now) -Encoding UTF8
     $codexBin = Find-Bin 'codex'
     if (-not $codexBin) { return }
-    $cmd = 'echo reply ok | "{0}" exec --sandbox read-only --skip-git-repo-check -' -f $codexBin
-    Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', $cmd -WindowStyle Hidden
+    $p = Start-CodexRefreshProcess -FilePath $codexBin
+    if (-not $p) { return }
+    $script:CodexRefreshProcess = $p
+    $script:CodexRefreshStartedAt = $now
+    Ensure-AppData
+    Set-Content -Path $tsFile -Value ([string]$now) -Encoding UTF8
   } catch {}
 }
 
@@ -1299,6 +1356,7 @@ function Stop-ResidentTray {
   foreach ($ni in $script:Tray.NIs) { try { $ni.Visible = $false; $ni.Dispose() } catch {} }
   foreach ($io in $script:Tray.IconObjs) { Remove-BatteryIcon $io }
   try { if ($script:Tray.Menu) { $script:Tray.Menu.Dispose() } } catch {}
+  [void](Clear-CodexRefreshProcess -Force)
   # 진행 중인 백그라운드 조회가 있으면 정리 (종료 시 러너스페이스가 남지 않도록)
   try { if ($script:Tray.Fetch.Runspace) { $script:Tray.Fetch.Runspace.Close(); $script:Tray.Fetch.Runspace.Dispose() } } catch {}
   try { if ($script:Tray.Fetch.PS) { $script:Tray.Fetch.PS.Dispose() } } catch {}
