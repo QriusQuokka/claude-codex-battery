@@ -30,12 +30,31 @@ if (-not $Force -and (Compare-Ver $remoteVer $localVer) -le 0) {
   return
 }
 
-# 최신 파일 다운로드
+# 최신 파일 다운로드 — 하나라도 실패하면 VERSION을 포함해 아무것도 커밋하지 않는다.
+# (부분 다운로드로 VERSION만 갱신되면 "이미 최신"으로 오판해 구버전에 영구히 갇히는 문제 방지)
 $targets = @('claude-codex-battery-win.ps1', 'launch-hidden.vbs', 'ccb-update.ps1', 'VERSION')
 $tmp = Join-Path $env:TEMP ('ccb-upd-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+$allOk = $true
 foreach ($t in $targets) {
-  try { Invoke-WebRequest -Uri "$RepoRaw/$t" -OutFile (Join-Path $tmp $t) -TimeoutSec 20 } catch { Write-Host ("⚠ {0} 다운로드 실패 — 건너뜀" -f $t) -ForegroundColor Yellow }
+  try { Invoke-WebRequest -Uri "$RepoRaw/$t" -OutFile (Join-Path $tmp $t) -TimeoutSec 20 }
+  catch { Write-Host ("⚠ {0} 다운로드 실패" -f $t) -ForegroundColor Yellow; $allOk = $false }
+}
+if (-not $allOk) {
+  Write-Host "⚠ 일부 파일을 받지 못해 업데이트를 중단합니다 (기존 상태는 그대로 유지됨). 나중에 다시 시도해 주세요." -ForegroundColor Yellow
+  Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+  return
+}
+
+# 받은 메인 스크립트가 최소한 파싱은 되는지 확인 (실행하지 않고 구문만 검사).
+# 깨진 스크립트를 커밋하면 트레이가 그냥 사라지고 사용자는 아무 신호도 못 받는다 — 그 전에 걸러낸다.
+$newMain = Join-Path $tmp 'claude-codex-battery-win.ps1'
+$parseErrors = $null
+[System.Management.Automation.Language.Parser]::ParseFile($newMain, [ref]$null, [ref]$parseErrors) | Out-Null
+if ($parseErrors -and $parseErrors.Count -gt 0) {
+  Write-Host "⚠ 새로 받은 메인 스크립트가 파싱되지 않습니다 — 업데이트를 중단합니다 (기존 상태 유지)." -ForegroundColor Red
+  Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+  return
 }
 
 # 실행 중인 인스턴스 중지 (명령줄에 이 스크립트 경로 + -Run 포함하는 powershell)
@@ -47,14 +66,34 @@ try {
 } catch {}
 Start-Sleep -Milliseconds 500
 
-# 백업 후 교체
-foreach ($t in $targets) {
-  $new = Join-Path $tmp $t
-  if (-not (Test-Path $new)) { continue }
-  $cur = Join-Path $dir $t
-  if (Test-Path $cur) { Copy-Item -LiteralPath $cur -Destination ($cur + '.bak') -Force }
-  Copy-Item -LiteralPath $new -Destination $cur -Force
+# 백업 후 교체 — 도중에 실패하면 지금까지 백업해 둔 .bak으로 롤백한다.
+$backedUp = @()
+$copyFailed = $false
+try {
+  foreach ($t in $targets) {
+    $new = Join-Path $tmp $t
+    if (-not (Test-Path $new)) { continue }
+    $cur = Join-Path $dir $t
+    if (Test-Path $cur) { Copy-Item -LiteralPath $cur -Destination ($cur + '.bak') -Force; $backedUp += $t }
+    Copy-Item -LiteralPath $new -Destination $cur -Force
+  }
+} catch {
+  $copyFailed = $true
+  Write-Host ("⚠ 파일 교체 중 오류: {0}" -f $_.Exception.Message) -ForegroundColor Red
 }
+
+if ($copyFailed) {
+  Write-Host "이전 버전으로 복구 중..." -ForegroundColor Yellow
+  foreach ($t in $backedUp) {
+    $cur = Join-Path $dir $t
+    $bak = $cur + '.bak'
+    if (Test-Path $bak) { try { Copy-Item -LiteralPath $bak -Destination $cur -Force } catch {} }
+  }
+  Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+  Write-Host "⚠ 업데이트 실패 — 이전 버전으로 복구했습니다." -ForegroundColor Yellow
+  return
+}
+
 Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host ("✅ v{0} 로 업데이트 (이전본은 .bak 보존)" -f $remoteVer)
 

@@ -67,6 +67,23 @@ function Ensure-AppData {
   }
 }
 
+# 로그 파일 append (조용한 실패 진단용) — 절대 throw 안 함, 모달 없음.
+function Write-CcbLog {
+  param([string]$Message)
+  try {
+    Ensure-AppData
+    $line = '[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Message
+    Add-Content -Path (Join-Path $script:APP_DATA 'ccb.log') -Value $line -Encoding UTF8 -ErrorAction SilentlyContinue
+  } catch {}
+}
+
+# API 응답 필드가 숫자가 아닐 수도 있음("", "N/A", 형식 변경 등) — throw 대신 $null.
+function ConvertTo-SafeDouble {
+  param($Value)
+  if ($null -eq $Value) { return $null }
+  try { return [double]$Value } catch { return $null }
+}
+
 # 지속시간 포맷 ("3d 21h" / "3h 18m" / "45m" / "0m") — 원본 fmtDur 이식
 function Format-Duration {
   param([double]$Seconds)
@@ -194,7 +211,9 @@ function ConvertFrom-UsageRaw {
   $win = {
     param($o)
     if ($null -eq $o) { return $null }
-    [pscustomobject]@{ pct = [double]$o.utilization; resetsAt = (ConvertTo-UnixSeconds $o.resets_at) }
+    $pct = ConvertTo-SafeDouble $o.utilization
+    if ($null -eq $pct) { return $null }   # 형식이 바뀌었으면 이 창은 건너뜀 — throw 대신 축소
+    [pscustomobject]@{ pct = $pct; resetsAt = (ConvertTo-UnixSeconds $o.resets_at) }
   }
   # 최상위 모델 주간 캡(weekly_scoped): limits[]에서 group=weekly && scope.model.display_name
   $fable = $null
@@ -203,8 +222,11 @@ function ConvertFrom-UsageRaw {
       $mdl = $null
       if ($l.scope -and $l.scope.model) { $mdl = $l.scope.model.display_name }
       if ($l.group -eq 'weekly' -and $mdl) {
-        $fable = [pscustomobject]@{ pct = [double]$l.percent; resetsAt = (ConvertTo-UnixSeconds $l.resets_at); model = $mdl }
-        break
+        $pct = ConvertTo-SafeDouble $l.percent
+        if ($null -ne $pct) {
+          $fable = [pscustomobject]@{ pct = $pct; resetsAt = (ConvertTo-UnixSeconds $l.resets_at); model = $mdl }
+          break
+        }
       }
     }
   }
@@ -229,16 +251,23 @@ function Get-ClaudeUsage {
   if ($shouldCall) {
     $raw = Invoke-UsageApi
     if ($raw) {
-      Write-UsageCache ([pscustomobject]@{ fetchedAt = $now; backoffUntil = 0; raw = $raw })
+      Write-UsageCache ([pscustomobject]@{ fetchedAt = $now; backoffUntil = 0; backoffInterval = 0; raw = $raw })
       return (ConvertFrom-UsageRaw -Raw $raw -MeasuredAt $now)
     } else {
-      # 실패 → 백오프 갱신(캐시가 있을 때만), 이후 캐시로 폴백
-      if ($cache) {
-        $prev = if ($cache.backoffUntil -and ([int64]$cache.backoffUntil -gt $now)) { [int64]$cache.backoffUntil - $now } else { $script:UsageApiThrottleSec }
-        $next = [math]::Min($prev * 2, $script:UsageApiMaxBackoff)
-        $cache.backoffUntil = $now + $next
-        Write-UsageCache $cache
+      # 실패 → 백오프 갱신. 캐시 유무와 무관하게 반드시 기록해야 최초 실행(dead token 등)에서도
+      # 재시도가 폭주하지 않는다. 직전 백오프 "간격"(interval, deadline이 아님)을 이어받아야
+      # 300→600→1200→…→cap 으로 실제 두 배씩 늘어난다.
+      # 이미 기록된 간격이 있으면 그걸 두 배로, 없으면(최초 실패) 기준값에서 시작 — 300→600→1200→…→cap.
+      $next = if ($cache -and $cache.backoffInterval -and [int64]$cache.backoffInterval -gt 0) {
+        [math]::Min([int64]$cache.backoffInterval * 2, $script:UsageApiMaxBackoff)
+      } else {
+        $script:UsageApiThrottleSec
       }
+      $updated = if ($cache) { $cache } else { [pscustomobject]@{ fetchedAt = $null; raw = $null } }
+      $updated | Add-Member -NotePropertyName backoffUntil -NotePropertyValue ($now + $next) -Force
+      $updated | Add-Member -NotePropertyName backoffInterval -NotePropertyValue $next -Force
+      Write-UsageCache $updated
+      $cache = $updated
     }
   }
 
@@ -555,71 +584,86 @@ function Measure-PixelString { param([string]$Str) return ($Str.Length * ($scrip
 function New-BatteryBitmap {
   param([double]$Remain, [string]$Tag, [bool]$Dark, [int]$Size = 32)
   $bmp = New-Object System.Drawing.Bitmap($Size, $Size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
-  $g = [System.Drawing.Graphics]::FromImage($bmp)
-  $g.Clear([System.Drawing.Color]::Transparent)
-  $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::None
-  $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::Half
+  $g = $null; $ink = $null; $dkInk = $null; $fillBrush = $null
+  try {
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.Clear([System.Drawing.Color]::Transparent)
+    $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::None
+    $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::Half
 
-  $inkColor = if ($Dark) { [Drawing.Color]::FromArgb(235,235,235) } else { [Drawing.Color]::FromArgb(45,45,45) }
-  $ink   = New-Object System.Drawing.SolidBrush($inkColor)
-  $dkInk = New-Object System.Drawing.SolidBrush([Drawing.Color]::FromArgb(30,30,30))
-  $fillColor = Get-HeatColor -Remain $Remain -Dark $Dark
-  $fillBrush = New-Object System.Drawing.SolidBrush($fillColor)
+    $inkColor = if ($Dark) { [Drawing.Color]::FromArgb(235,235,235) } else { [Drawing.Color]::FromArgb(45,45,45) }
+    $ink   = New-Object System.Drawing.SolidBrush($inkColor)
+    $dkInk = New-Object System.Drawing.SolidBrush([Drawing.Color]::FromArgb(30,30,30))
+    $fillColor = Get-HeatColor -Remain $Remain -Dark $Dark
+    $fillBrush = New-Object System.Drawing.SolidBrush($fillColor)
 
-  # 논리 그리드: 픽셀 폰트 배율 sc. size=32 → sc=2 (숫자 8px 높이). size=16 → sc=1.
-  $sc = [math]::Max(1, [math]::Floor($Size / 16))
+    # 논리 그리드: 픽셀 폰트 배율 sc. size=32 → sc=2 (숫자 8px 높이). size=16 → sc=1.
+    $sc = [math]::Max(1, [math]::Floor($Size / 16))
 
-  # 상단 태그 밴드 + 하단 캡슐로 분리 (겹침 방지). 태그는 size>=24 에서만 표시.
-  $showTag = ($Tag -and $Size -ge 24)
-  $topPad = if ($showTag) { [int]($Size * 0.30) } else { [int]($Size * 0.14) }
-  $botPad = [int]($Size * 0.12)
-  $bx = [int]($Size * 0.05); $bw = [int]($Size * 0.82)
-  $by = $topPad; $bh = $Size - $topPad - $botPad
-  $border = [math]::Max(1, [int]($Size / 16))
-  # 테두리 (사각 캡슐)
-  $g.FillRectangle($ink, $bx, $by, $bw, $border)                       # 상
-  $g.FillRectangle($ink, $bx, $by + $bh - $border, $bw, $border)       # 하
-  $g.FillRectangle($ink, $bx, $by, $border, $bh)                       # 좌
-  $g.FillRectangle($ink, $bx + $bw - $border, $by, $border, $bh)       # 우
-  # 단자(nub)
-  $nubH = [int]($bh * 0.4)
-  $g.FillRectangle($ink, $bx + $bw, $by + [int](($bh - $nubH)/2), [math]::Max(1,[int]($Size/16)), $nubH)
-  # 잔량 채움 (좌측부터)
-  $innerX = $bx + $border; $innerY = $by + $border
-  $innerW = $bw - 2 * $border; $innerH = $bh - 2 * $border
-  $v = [math]::Max(0, [math]::Min(100, $Remain))
-  $fw = [int][math]::Round(($v / 100) * $innerW)
-  if ($fw -gt 0) { $g.FillRectangle($fillBrush, $innerX, $innerY, $fw, $innerH) }
-  $fillBoundaryLogical = [int][math]::Floor(($innerX + $fw) / $sc)
+    # 상단 태그 밴드 + 하단 캡슐로 분리 (겹침 방지). 태그는 size>=24 에서만 표시.
+    $showTag = ($Tag -and $Size -ge 24)
+    $topPad = if ($showTag) { [int]($Size * 0.30) } else { [int]($Size * 0.14) }
+    $botPad = [int]($Size * 0.12)
+    $bx = [int]($Size * 0.05); $bw = [int]($Size * 0.82)
+    $by = $topPad; $bh = $Size - $topPad - $botPad
+    $border = [math]::Max(1, [int]($Size / 16))
+    # 테두리 (사각 캡슐)
+    $g.FillRectangle($ink, $bx, $by, $bw, $border)                       # 상
+    $g.FillRectangle($ink, $bx, $by + $bh - $border, $bw, $border)       # 하
+    $g.FillRectangle($ink, $bx, $by, $border, $bh)                       # 좌
+    $g.FillRectangle($ink, $bx + $bw - $border, $by, $border, $bh)       # 우
+    # 단자(nub)
+    $nubH = [int]($bh * 0.4)
+    $g.FillRectangle($ink, $bx + $bw, $by + [int](($bh - $nubH)/2), [math]::Max(1,[int]($Size/16)), $nubH)
+    # 잔량 채움 (좌측부터)
+    $innerX = $bx + $border; $innerY = $by + $border
+    $innerW = $bw - 2 * $border; $innerH = $bh - 2 * $border
+    $v = [math]::Max(0, [math]::Min(100, $Remain))
+    $fw = [int][math]::Round(($v / 100) * $innerW)
+    if ($fw -gt 0) { $g.FillRectangle($fillBrush, $innerX, $innerY, $fw, $innerH) }
+    $fillBoundaryLogical = [int][math]::Floor(($innerX + $fw) / $sc)
 
-  # 잔량 숫자 (캡슐 안, 가운데). 채움 위 픽셀은 어두운 잉크, 빈 배경 위는 ink → 어디서나 대비.
-  $numStr = [string][int][math]::Round($v)
-  $numWpx = (Measure-PixelString $numStr) * $sc
-  $numXlogical = [int]([math]::Floor(($bx + ($bw - $numWpx)/2) / $sc))
-  $numYlogical = [int]([math]::Floor(($by + ($bh - $script:GLYPH_H * $sc)/2) / $sc))
-  Draw-PixelString -G $g -X $numXlogical -Y $numYlogical -Str $numStr -Sc $sc -Brush $ink -AltBrush $dkInk -BoundaryX $fillBoundaryLogical | Out-Null
+    # 잔량 숫자 (캡슐 안, 가운데). 채움 위 픽셀은 어두운 잉크, 빈 배경 위는 ink → 어디서나 대비.
+    $numStr = [string][int][math]::Round($v)
+    $numWpx = (Measure-PixelString $numStr) * $sc
+    $numXlogical = [int]([math]::Floor(($bx + ($bw - $numWpx)/2) / $sc))
+    $numYlogical = [int]([math]::Floor(($by + ($bh - $script:GLYPH_H * $sc)/2) / $sc))
+    Draw-PixelString -G $g -X $numXlogical -Y $numYlogical -Str $numStr -Sc $sc -Brush $ink -AltBrush $dkInk -BoundaryX $fillBoundaryLogical | Out-Null
 
-  # 창 태그 (상단 밴드 중앙). 서비스(C/X)는 색/툴팁/순서로 구분.
-  if ($showTag) {
-    $tagSc = [math]::Max(1, [int]($Size / 20))
-    $tagWpx = (Measure-PixelString $Tag) * $tagSc
-    $tagXlogical = [int]([math]::Floor(($bx + ($bw - $tagWpx)/2) / $tagSc))
-    $tagYlogical = [int]([math]::Floor((($topPad - $script:GLYPH_H * $tagSc)/2) / $tagSc))
-    Draw-PixelString -G $g -X $tagXlogical -Y $tagYlogical -Str $Tag -Sc $tagSc -Brush $ink | Out-Null
+    # 창 태그 (상단 밴드 중앙). 서비스(C/X)는 색/툴팁/순서로 구분.
+    if ($showTag) {
+      $tagSc = [math]::Max(1, [int]($Size / 20))
+      $tagWpx = (Measure-PixelString $Tag) * $tagSc
+      $tagXlogical = [int]([math]::Floor(($bx + ($bw - $tagWpx)/2) / $tagSc))
+      $tagYlogical = [int]([math]::Floor((($topPad - $script:GLYPH_H * $tagSc)/2) / $tagSc))
+      Draw-PixelString -G $g -X $tagXlogical -Y $tagYlogical -Str $Tag -Sc $tagSc -Brush $ink | Out-Null
+    }
+
+    return $bmp
+  } finally {
+    if ($ink) { $ink.Dispose() }
+    if ($dkInk) { $dkInk.Dispose() }
+    if ($fillBrush) { $fillBrush.Dispose() }
+    if ($g) { $g.Dispose() }
   }
-
-  $ink.Dispose(); $dkInk.Dispose(); $fillBrush.Dispose(); $g.Dispose()
-  return $bmp
 }
 
 # Bitmap → [System.Drawing.Icon]. 반환 객체에 .Icon 과 해제용 .Handle 포함.
 function New-BatteryIcon {
   param([double]$Remain, [string]$Tag, [bool]$Dark, [int]$Size = 32)
   $bmp = New-BatteryBitmap -Remain $Remain -Tag $Tag -Dark $Dark -Size $Size
-  $hicon = $bmp.GetHicon()
-  $icon = [System.Drawing.Icon]::FromHandle($hicon)
-  $bmp.Dispose()
-  return [pscustomobject]@{ Icon = $icon; Handle = $hicon }
+  $hicon = [IntPtr]::Zero
+  $icon = $null
+  try {
+    $hicon = $bmp.GetHicon()
+    $icon = [System.Drawing.Icon]::FromHandle($hicon)
+    return [pscustomobject]@{ Icon = $icon; Handle = $hicon }
+  } finally {
+    $bmp.Dispose()
+    # Icon.FromHandle이 GetHicon 이후 실패하면 $icon이 세팅되지 않으므로 여기서 HICON을 직접 해제(누수 방지).
+    # 성공한 경우엔 소유권이 반환된 객체로 넘어가므로 여기선 건드리지 않음(나중에 Remove-BatteryIcon이 해제).
+    if (-not $icon -and $hicon -ne [IntPtr]::Zero) { try { [CCB.Native]::DestroyIcon($hicon) | Out-Null } catch {} }
+  }
 }
 # 아이콘 핸들 해제 (누수 방지) — 반드시 NotifyIcon에서 떼어낸 뒤 호출.
 function Remove-BatteryIcon {
@@ -1055,15 +1099,21 @@ function Complete-DataFetch {
 function New-PlaceholderBitmap {
   param([bool]$Dark, [int]$Size = 32)
   $bmp = New-Object System.Drawing.Bitmap($Size, $Size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
-  $g = [System.Drawing.Graphics]::FromImage($bmp); $g.Clear([Drawing.Color]::Transparent)
-  $inkC = if ($Dark) { [Drawing.Color]::FromArgb(150,150,150) } else { [Drawing.Color]::FromArgb(120,120,120) }
-  $ink = New-Object System.Drawing.SolidBrush($inkC)
-  $bw = [int]($Size*0.82); $bh = [int]($Size*0.5); $bx = [int]($Size*0.05); $by = [int](($Size-$bh)/2)
-  $b = [math]::Max(1,[int]($Size/16))
-  $g.FillRectangle($ink,$bx,$by,$bw,$b); $g.FillRectangle($ink,$bx,$by+$bh-$b,$bw,$b)
-  $g.FillRectangle($ink,$bx,$by,$b,$bh); $g.FillRectangle($ink,$bx+$bw-$b,$by,$b,$bh)
-  $g.FillRectangle($ink, $bx+[int]($bw*0.35), $by+[int]($bh/2)-$b, [int]($bw*0.3), 2*$b)  # 대시
-  $ink.Dispose(); $g.Dispose(); return $bmp
+  $g = $null; $ink = $null
+  try {
+    $g = [System.Drawing.Graphics]::FromImage($bmp); $g.Clear([Drawing.Color]::Transparent)
+    $inkC = if ($Dark) { [Drawing.Color]::FromArgb(150,150,150) } else { [Drawing.Color]::FromArgb(120,120,120) }
+    $ink = New-Object System.Drawing.SolidBrush($inkC)
+    $bw = [int]($Size*0.82); $bh = [int]($Size*0.5); $bx = [int]($Size*0.05); $by = [int](($Size-$bh)/2)
+    $b = [math]::Max(1,[int]($Size/16))
+    $g.FillRectangle($ink,$bx,$by,$bw,$b); $g.FillRectangle($ink,$bx,$by+$bh-$b,$bw,$b)
+    $g.FillRectangle($ink,$bx,$by,$b,$bh); $g.FillRectangle($ink,$bx+$bw-$b,$by,$b,$bh)
+    $g.FillRectangle($ink, $bx+[int]($bw*0.35), $by+[int]($bh/2)-$b, [int]($bw*0.3), 2*$b)  # 대시
+    return $bmp
+  } finally {
+    if ($ink) { $ink.Dispose() }
+    if ($g) { $g.Dispose() }
+  }
 }
 
 # 순수 렌더링만 수행(네트워크/프로세스/파일 조회 없음) — 항상 UI 스레드에서, 항상 캐시된 데이터로 호출.
@@ -1152,25 +1202,48 @@ function Stop-ResidentTray {
   [System.Windows.Forms.Application]::Exit()
 }
 
+# 비정상 종료(로그오프/시스템 종료/taskkill) 전용 최소 정리 — 고스트 트레이 아이콘 방지가 유일한 목적.
+# ProcessExit 핸들러에서 호출될 수 있어 빠르고 예외 없이 끝나야 함(Application.Exit 등 무거운 호출 금지).
+function Hide-TrayIcons {
+  foreach ($ni in $script:Tray.NIs) { try { $ni.Visible = $false } catch {} }
+}
+
 function Start-ResidentTray {
-  # 단일 인스턴스 (named mutex)
-  $created = $false
-  $script:Tray.Mutex = New-Object System.Threading.Mutex($true, 'Global\ClaudeCodexBatteryWin', [ref]$created)
-  if (-not $created) { return }  # 이미 실행 중 → 조용히 종료
-  Ensure-AppData
-  [System.Windows.Forms.Application]::EnableVisualStyles()
-  $script:Tray.Timer = New-Object System.Windows.Forms.Timer
-  $script:Tray.Timer.Interval = 120000   # 2분 — 조회 시작 + 캐시로부터 렌더 (블로킹 없음)
-  $script:Tray.Timer.Add_Tick({ Update-Tray })
-  $script:Tray.PollTimer = New-Object System.Windows.Forms.Timer
-  $script:Tray.PollTimer.Interval = 2000   # 2초 — 백그라운드 조회 완료를 값싸게 확인해 빠르게 반영
-  $script:Tray.PollTimer.Add_Tick({ Poll-TrayFetch })
-  Update-Tray          # 초기 렌더 — 캐시가 비어도 즉시 placeholder를 보여주고, 조회는 백그라운드로 시작됨
-  $script:Tray.Timer.Start()
-  $script:Tray.PollTimer.Start()
-  [System.Windows.Forms.Application]::Run()
-  # 종료 정리
-  try { $script:Tray.Mutex.ReleaseMutex() } catch {}
+  try {
+    # 단일 인스턴스 (named mutex)
+    $created = $false
+    $script:Tray.Mutex = New-Object System.Threading.Mutex($true, 'Global\ClaudeCodexBatteryWin', [ref]$created)
+    if (-not $created) { return }  # 이미 실행 중 → 조용히 종료
+    Ensure-AppData
+    [System.Windows.Forms.Application]::EnableVisualStyles()
+
+    # 로그오프/종료 시 정상적으로 트레이를 정리하고, 프로세스가 그냥 죽는 경우(taskkill 등)에도
+    # 최소한 아이콘을 숨겨 고스트 트레이 아이콘이 남지 않게 한다.
+    try {
+      Register-ObjectEvent -InputObject ([Microsoft.Win32.SystemEvents]) -EventName 'SessionEnding' `
+        -SourceIdentifier 'CcbSessionEnding' -Action { Stop-ResidentTray } -ErrorAction SilentlyContinue | Out-Null
+    } catch {}
+    try {
+      [AppDomain]::CurrentDomain.add_ProcessExit({ Hide-TrayIcons })
+    } catch {}
+
+    $script:Tray.Timer = New-Object System.Windows.Forms.Timer
+    $script:Tray.Timer.Interval = 120000   # 2분 — 조회 시작 + 캐시로부터 렌더 (블로킹 없음)
+    $script:Tray.Timer.Add_Tick({ Update-Tray })
+    $script:Tray.PollTimer = New-Object System.Windows.Forms.Timer
+    $script:Tray.PollTimer.Interval = 2000   # 2초 — 백그라운드 조회 완료를 값싸게 확인해 빠르게 반영
+    $script:Tray.PollTimer.Add_Tick({ Poll-TrayFetch })
+    Update-Tray          # 초기 렌더 — 캐시가 비어도 즉시 placeholder를 보여주고, 조회는 백그라운드로 시작됨
+    $script:Tray.Timer.Start()
+    $script:Tray.PollTimer.Start()
+    [System.Windows.Forms.Application]::Run()
+    # 종료 정리
+    try { $script:Tray.Mutex.ReleaseMutex() } catch {}
+  } catch {
+    # 상주 실행이 시작조차 못 하면(뮤텍스/타이머/트레이 초기화 실패 등) 트레이도 없고 콘솔도 없어
+    # 사용자에게 아무 신호가 안 갈 수 있다 — 최소한 로그 파일에는 남긴다. 모달은 띄우지 않는다.
+    Write-CcbLog ("Start-ResidentTray 실패: {0}`n{1}" -f $_.Exception.Message, $_.ScriptStackTrace)
+  }
 }
 
 # ══════════════════════════════════════════════════════════════════

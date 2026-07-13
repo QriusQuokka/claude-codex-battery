@@ -24,12 +24,18 @@ Write-Host ("✅ PowerShell {0}" -f $PSVersionTable.PSVersion)
 
 # 2) 앱 파일 복사
 if (-not (Test-Path $dstDir)) { New-Item -ItemType Directory -Path $dstDir -Force | Out-Null }
-foreach ($f in $files) {
-  $src = Join-Path $srcDir $f
-  if (Test-Path $src) { Copy-Item -LiteralPath $src -Destination (Join-Path $dstDir $f) -Force }
-  elseif ($f -ne 'VERSION') { Write-Host ("⚠ 원본에 {0} 없음 — 건너뜀" -f $f) -ForegroundColor Yellow }
+try {
+  foreach ($f in $files) {
+    $src = Join-Path $srcDir $f
+    if (Test-Path $src) { Copy-Item -LiteralPath $src -Destination (Join-Path $dstDir $f) -Force }
+    elseif ($f -ne 'VERSION') { Write-Host ("⚠ 원본에 {0} 없음 — 건너뜀" -f $f) -ForegroundColor Yellow }
+  }
+  Write-Host ("✅ 앱 배치: {0}" -f $dstDir)
+} catch {
+  Write-Host ("❌ 앱 파일 복사 실패: {0}" -f $_.Exception.Message) -ForegroundColor Red
+  Write-Host "설치를 중단합니다." -ForegroundColor Red
+  return
 }
-Write-Host ("✅ 앱 배치: {0}" -f $dstDir)
 
 # 3) 시작프로그램 등록 (재부팅/재로그인 후 자동 실행)
 if (-not $NoAutostart) {
