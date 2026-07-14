@@ -440,7 +440,7 @@ function Get-CodexUsage {
   return $null
 }
 
-# 창 상태 계산 — 원본 windowState 이식. { pct, resetsIn, stale }
+# 창 상태 계산 — 원본 windowState 이식. { pct, resetsIn, stale, windowMinutes }
 function Get-CodexWindowState {
   param($W)
   if (-not $W) { return $null }
@@ -449,7 +449,41 @@ function Get-CodexWindowState {
   if ($W.resets_at) { $stale = ([double]$W.resets_at -lt $now) }
   $pct = if ($stale) { 0.0 } else { [double]$W.used_percent }
   $resetsIn = if ($W.resets_at) { [double]$W.resets_at - $now } else { $null }
-  [pscustomobject]@{ pct = $pct; resetsIn = $resetsIn; stale = $stale }
+  $windowMinutes = if ($null -ne $W.window_minutes) { [double]$W.window_minutes } else { $null }
+  [pscustomobject]@{ pct = $pct; resetsIn = $resetsIn; stale = $stale; windowMinutes = $windowMinutes }
+}
+
+# Codex rate_limits의 primary/secondary라는 위치는 한도 종류를 보장하지 않는다.
+# window_minutes를 우선해 24시간 이상인 창을 주간(XW)으로 분류한다. 구버전 로그에
+# 기간 정보가 없을 때만 기존 위치(primary=5시간, secondary=주간) 규칙을 사용한다.
+function Get-CodexWindowTag {
+  param($Window, [string]$FallbackTag)
+  if (-not $Window) { return $null }
+  if ($null -ne $Window.window_minutes -and [double]$Window.window_minutes -ge 1440) { return 'W' }
+  return $FallbackTag
+}
+
+# 실제로 표시할 Codex 창 목록. 같은 종류가 중복되어 들어오면 첫 항목만 표시해
+# 트레이에 XW가 두 번 나타나지 않게 한다.
+function Get-CodexDisplayWindows {
+  param($Codex)
+  if (-not $Codex) { return }
+  $shown = @{}
+  foreach ($entry in @(
+    [pscustomobject]@{ window = $Codex.primary; fallback = '5' }
+    [pscustomobject]@{ window = $Codex.secondary; fallback = 'W' }
+  )) {
+    if (-not $entry.window) { continue }
+    $tag = Get-CodexWindowTag -Window $entry.window -FallbackTag $entry.fallback
+    if ($shown.ContainsKey($tag)) { continue }
+    $shown[$tag] = $true
+    $state = Get-CodexWindowState $entry.window
+    [pscustomobject]@{
+      tag   = $tag
+      label = if ($tag -eq 'W') { '주간' } else { '5시간' }
+      state = $state
+    }
+  }
 }
 
 # Codex 자동 갱신 프로세스는 UI 스레드에서 기다리지 않고 추적만 한다. 5분을 넘기면 다음 틱에 종료해
@@ -714,7 +748,7 @@ function Draw-PixelString {
 function Measure-PixelString { param([string]$Str) return ($Str.Length * ($script:GLYPH_W + 1) - 1) }
 
 # 배터리 아이콘 하나를 Bitmap으로 렌더. service=claude/codex, tag=창 식별(5/W/F).
-#   Claude는 오른쪽 단자+C, Codex는 왼쪽 단자+X. 창은 우상단 점 1/2/3개로 식별한다.
+#   Claude는 오른쪽 단자+C, Codex는 왼쪽 단자+X. 상단에는 C5/CW/CF 또는 X5/XW를 표기한다.
 function New-BatteryBitmap {
   param([double]$Remain, [string]$Tag, [string]$Service, [bool]$Dark, [int]$Size = 32, [bool]$Stale = $false)
   $bmp = New-Object System.Drawing.Bitmap($Size, $Size, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
@@ -770,20 +804,12 @@ function New-BatteryBitmap {
     $numYlogical = [int]([math]::Floor(($by + ($bh - $script:GLYPH_H * $sc)/2) / $sc))
     Draw-PixelString -G $g -X $numXlogical -Y $numYlogical -Str $numStr -Sc $sc -Brush $ink -AltBrush $dkInk -BoundaryX $fillBoundaryLogical | Out-Null
 
-    # 상단 식별: 좌측 C/X 픽셀 글자 + 우측 창 마커(5시간=1, 주간=2, Fable=3).
+    # 상단 식별: C5/CW/CF 또는 X5/XW 픽셀 코드.
     if ($showIdentity) {
       $idSc = [math]::Max(1, [int]($Size / 24))
       $serviceTag = if ($Service -eq 'claude') { 'C' } else { 'X' }
       $idY = [int]([math]::Max(0, [math]::Floor(($topPad - $script:GLYPH_H * $idSc) / (2 * $idSc))))
-      Draw-PixelString -G $g -X 1 -Y $idY -Str $serviceTag -Sc $idSc -Brush $ink | Out-Null
-      $markerCount = if ($Tag -eq '5') { 1 } elseif ($Tag -eq 'W') { 2 } elseif ($Tag -eq 'F') { 3 } else { 0 }
-      $dot = [math]::Max(1, [int]($Size / 16))
-      $gap = $dot
-      for ($i = 0; $i -lt $markerCount; $i++) {
-        $mx = $Size - 2 - $dot - $i * ($dot + $gap)
-        $my = [math]::Max(0, [int](($topPad - $dot) / 2))
-        $g.FillRectangle($ink, $mx, $my, $dot, $dot)
-      }
+      Draw-PixelString -G $g -X 1 -Y $idY -Str ($serviceTag + $Tag) -Sc $idSc -Brush $ink | Out-Null
     }
 
     return $bmp
@@ -847,20 +873,14 @@ function Get-BatteryItems {
     }
   }
   if ($Codex) {
-    $p = Get-CodexWindowState $Codex.primary
-    $s = Get-CodexWindowState $Codex.secondary
-    if ($p -or $s) {
-      if ($p) {
-        $r = [math]::Max(0, 100 - $p.pct)
-        $tip = "Codex 5시간: {0}% 남음" -f [int]$r
-        if ($p.stale) { $tip += ' · 리셋됨' } elseif ($p.resetsIn) { $tip += ' · 리셋 ' + (Format-Duration $p.resetsIn) }
-        $items += [pscustomobject]@{ key='X5'; tag='5'; remain=$r; stale=[bool]$p.stale; service='codex'; tip=$tip }
-      }
-      if ($s) {
-        $r = [math]::Max(0, 100 - $s.pct)
-        $tip = "Codex 주간: {0}% 남음" -f [int]$r
-        if ($s.stale) { $tip += ' · 리셋됨' } elseif ($s.resetsIn) { $tip += ' · 리셋 ' + (Format-Duration $s.resetsIn) }
-        $items += [pscustomobject]@{ key='XW'; tag='W'; remain=$r; stale=[bool]$s.stale; service='codex'; tip=$tip }
+    $windows = @(Get-CodexDisplayWindows $Codex)
+    if ($windows.Count -gt 0) {
+      foreach ($window in $windows) {
+        $st = $window.state
+        $r = [math]::Max(0, 100 - $st.pct)
+        $tip = "Codex {0}: {1}% 남음" -f $window.label, [int]$r
+        if ($st.stale) { $tip += ' · 리셋됨' } elseif ($st.resetsIn) { $tip += ' · 리셋 ' + (Format-Duration $st.resetsIn) }
+        $items += [pscustomobject]@{ key=('X' + $window.tag); tag=$window.tag; remain=$r; stale=[bool]$st.stale; service='codex'; tip=$tip }
       }
     } elseif ($Codex.credits) {
       $cr = $Codex.credits
@@ -1142,9 +1162,8 @@ function Build-DetailMenu {
   if ($hasCodex) {
     $planStr = if ($Codex.plan) { ' · ' + $Codex.plan } elseif ($Codex.limitId) { ' · ' + $Codex.limitId } else { '' }
     Add-Label $menu ('Codex' + $planStr) $gray $script:MONO | Out-Null
-    $p = Get-CodexWindowState $Codex.primary
-    $s = Get-CodexWindowState $Codex.secondary
-    if (-not $p -and -not $s -and $Codex.credits) {
+    $windows = @(Get-CodexDisplayWindows $Codex)
+    if ($windows.Count -eq 0 -and $Codex.credits) {
       $cr = $Codex.credits
       if ($cr.unlimited) { Add-Label $menu '크레딧  무제한' (Get-HeatRemainColor 100) $script:MONO | Out-Null }
       elseif (-not $cr.has_credits -or [double]$cr.balance -le 0) { Add-Label $menu '크레딧  소진 · 한도 초과 (0)' (Get-HeatRemainColor 0) $script:MONO | Out-Null }
@@ -1157,8 +1176,7 @@ function Build-DetailMenu {
       $reset = if ($st.stale) { '  ·  리셋됨' } elseif ($st.resetsIn) { '  ·  리셋 ' + (Format-Duration $st.resetsIn) } else { '' }
       Add-Label $menu ('{0} ▕{1}▏ {2}%  (사용 {3}%){4}' -f $label, (Get-Bar $r 20), [int]$r, [int]$st.pct, $reset) (Get-HeatRemainColor $r) $script:MONO | Out-Null
     }
-    & $cxRow '5시간 남음' $p
-    & $cxRow '주간 남음 ' $s
+    foreach ($window in $windows) { & $cxRow ($window.label + ' 남음') $window.state }
     $age = $now - $Codex.measuredAt
     $staleWarn = $age -gt 3*3600
     $warnTxt = if ($staleWarn) { '  ·  ⚠ 리셋됐을 수 있음, Codex 쓰면 갱신' } else { ' (Codex 세션 기준)' }
