@@ -19,11 +19,41 @@ $srcDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $dstDir = Join-Path $env:LOCALAPPDATA 'claude-codex-battery'
 $files = @('claude-codex-battery-win.ps1', 'launch-hidden.vbs', 'ccb-update.ps1', 'VERSION')
 
+# 설치 파일만 바꾸고 기존 PowerShell 프로세스를 남겨 두면 mutex 때문에 새 코드가 실행되지 않는다.
+# 정확히 설치 대상 main script를 -Run으로 실행 중인 같은 사용자 프로세스만 종료한다.
+function Stop-InstalledInstance {
+  param([string]$MainScript)
+  $stopped = @()
+  try {
+    $full = [System.IO.Path]::GetFullPath($MainScript)
+    Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" | Where-Object {
+      $_.CommandLine -and $_.CommandLine.IndexOf($full, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and $_.CommandLine -match '(?i)(?:^|\s)-Run(?:\s|$)'
+    } | ForEach-Object {
+      Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop
+      $stopped += $_.ProcessId
+    }
+    if ($stopped.Count -gt 0) {
+      $deadline = [DateTime]::UtcNow.AddSeconds(5)
+      do {
+        $alive = @($stopped | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+        if ($alive.Count -eq 0) { break }
+        Start-Sleep -Milliseconds 100
+      } while ([DateTime]::UtcNow -lt $deadline)
+      Write-Host ("✅ 기존 인스턴스 종료: PID {0}" -f ($stopped -join ','))
+    }
+    return $true
+  } catch {
+    Write-Host ("⚠ 기존 인스턴스 확인/종료 실패: {0}" -f $_.Exception.Message) -ForegroundColor Yellow
+    return $false
+  }
+}
+
 # 1) PowerShell 버전 안내 (5.1+ 권장)
 Write-Host ("✅ PowerShell {0}" -f $PSVersionTable.PSVersion)
 
-# 2) 앱 파일 복사
+# 2) 기존 인스턴스 종료 후 앱 파일 복사
 if (-not (Test-Path $dstDir)) { New-Item -ItemType Directory -Path $dstDir -Force | Out-Null }
+[void](Stop-InstalledInstance -MainScript (Join-Path $dstDir 'claude-codex-battery-win.ps1'))
 try {
   foreach ($f in $files) {
     $src = Join-Path $srcDir $f
@@ -55,7 +85,7 @@ if (-not $NoAutostart) {
   }
 }
 
-# 4) 즉시 실행 (기존 인스턴스가 있으면 mutex로 중복 방지됨)
+# 4) 즉시 실행 (설치한 새 파일로 새 인스턴스 시작)
 if (-not $NoLaunch) {
   $vbs = Join-Path $dstDir 'launch-hidden.vbs'
   Start-Process -FilePath 'wscript.exe' -ArgumentList ('"{0}"' -f $vbs)

@@ -15,7 +15,7 @@
 [CmdletBinding()]
 param(
   # 테스트/디버그: 특정 데이터 함수의 결과를 JSON으로 덤프하고 종료.
-  #   claude | codex | models | blocks | all
+  #   auth | claude | codex | models | blocks | all
   [string]$Probe,
   # Get-ClaudeUsage가 스로틀을 무시하고 즉시 API를 호출하도록 강제.
   [switch]$ForceApi,
@@ -34,16 +34,17 @@ param(
 # ══════════════════════════════════════════════════════════════════
 #  CONFIG — 상단 상수 (사용자가 조정하는 지점)
 # ══════════════════════════════════════════════════════════════════
-$script:VERSION            = '1.1.2-win'              # 이 Windows 포트의 버전
+$script:VERSION            = '1.1.3-win'              # 이 Windows 포트의 버전
 $script:EnableUsageApi     = $true                    # ★ Claude 사용량 API 호출 on/off (프라이버시 opt-out 지점)
-$script:ClaudeUaVersion    = '2.1.206'                # User-Agent: claude-code/<이 값> (형식이 중요, 정확한 값은 무관)
+$script:ClaudeUaVersion    = '2.1.211'                # User-Agent: claude-code/<이 값> (형식이 중요)
 $script:UsageApiThrottleSec = 300                     # API 최소 호출 간격(초). 429 방지 — 렌더보다 훨씬 길게.
 $script:UsageApiMaxBackoff  = 3600                    # 429 시 지수 백오프 상한(초)
 $script:CodexAutoRefresh   = $false                   # Codex 소진 시 백그라운드 자동 갱신(토큰 소모) — 기본 off
 $script:EnableUpdateCheck  = $true                    # 24h 1회 GitHub VERSION 확인 (유일한 그외 네트워크 호출). $false로 완전 비활성
 
 $script:HOME_DIR   = $env:USERPROFILE
-$script:CLAUDE_DIR = Join-Path $script:HOME_DIR '.claude'
+# Claude Code 공식 동작과 동일하게 CLAUDE_CONFIG_DIR을 우선한다.
+$script:CLAUDE_DIR = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $script:HOME_DIR '.claude' }
 $script:CRED_FILE  = Join-Path $script:CLAUDE_DIR '.credentials.json'
 $script:APP_DATA   = Join-Path $env:LOCALAPPDATA 'claude-codex-battery'
 $script:USAGE_CACHE = Join-Path $script:APP_DATA 'usage-cache.json'
@@ -100,7 +101,17 @@ function Format-ClaudeFailure {
   param($Failure, $MeasuredAt)
   if (-not $Failure) { return '' }
   $now = Get-UnixNow
-  if ($Failure.kind -eq 'auth') { return '⚠ 재로그인 필요 — Claude Code에서 /login' }
+  switch ([string]$Failure.kind) {
+    'credentialMissing' { return '⚠ Claude Code 로그인 정보 없음 — Claude Code에서 /login' }
+    'credentialInvalid' { return '⚠ Claude 인증 파일을 읽을 수 없음 — 진단 로그 확인' }
+    'tokenMissing'      { return '⚠ Claude OAuth 토큰 없음 — Claude Code에서 /login' }
+    'tokenExpired'      { return '⚠ Claude 인증 토큰 만료 — Claude Code를 실행해 갱신' }
+    'http401'           { return '⚠ 로그인은 정상이나 사용량 API 인증 실패 — 다시 시도 중' }
+    'http403'           { return '⚠ 사용량 API 접근 거부 — 계정 권한 확인 필요' }
+    'schemaChanged'     { return '⚠ 사용량 API 응답 형식 변경 — 호환성 확인 필요' }
+    # 1.1.2 캐시 호환: 예전 auth를 곧바로 재로그인 필요로 단정하지 않는다.
+    'auth'              { return '⚠ Claude 사용량 인증 상태 확인 필요 — 지금 새로고침' }
+  }
   if ($Failure.kind -eq 'rateLimit') {
     $retryAt = 0
     try { $retryAt = [int64]$Failure.retryAt } catch {}
@@ -187,7 +198,7 @@ function Invoke-ExternalCommand {
 
 # 캐시 파일 구조:
 # { fetchedAt:<unix>, backoffUntil:<unix>, backoffInterval:<sec>, raw:<API 응답 그대로>,
-#   failure:{ kind:auth|rateLimit|network, statusCode, failedAt, retryAt } }
+#   failure:{ kind, statusCode, failedAt, retryAt, credentialStamp, retryPerformed } }
 function Read-UsageCache {
   if (-not (Test-Path $script:USAGE_CACHE)) { return $null }
   try { return (Get-Content $script:USAGE_CACHE -Raw -Encoding UTF8 | ConvertFrom-Json) } catch { return $null }
@@ -214,32 +225,93 @@ function Write-UsageCache {
   }
 }
 
-# API 1회 호출 — 항상 { ok, raw, failure } 반환 (절대 throw 안 함).
-# failure를 값으로 반환해야 캐시를 거쳐 트레이 UI까지 실패 원인을 보낼 수 있다.
-function Invoke-UsageApi {
-  if (-not $script:EnableUsageApi) { return [pscustomobject]@{ ok=$false; raw=$null; failure=$null } }
-  $now = Get-UnixNow
-  $authFailure = { [pscustomobject]@{ kind='auth'; statusCode=401; failedAt=$now; retryAt=0 } }
-  if (-not (Test-Path $script:CRED_FILE)) { return [pscustomobject]@{ ok=$false; raw=$null; failure=(& $authFailure) } }
-  $tok = $null
+# 토큰 원문을 노출하지 않고 실패 단계와 자격 증명 파일 세대(stamp)만 반환한다.
+function New-ClaudeFailure {
+  param([string]$Kind, [int]$StatusCode = 0, [int64]$CredentialStamp = 0, [string]$Detail = '')
+  [pscustomobject]@{
+    kind = $Kind; statusCode = $StatusCode; failedAt = (Get-UnixNow); retryAt = 0
+    credentialStamp = $CredentialStamp; detail = $Detail; retryPerformed = $false
+  }
+}
+
+function Get-ClaudeCredentialStamp {
   try {
-    $cred = Get-Content $script:CRED_FILE -Raw -Encoding UTF8 | ConvertFrom-Json
-    $tok = $cred.claudeAiOauth.accessToken
-  } catch { return [pscustomobject]@{ ok=$false; raw=$null; failure=(& $authFailure) } }
-  if (-not $tok) { return [pscustomobject]@{ ok=$false; raw=$null; failure=(& $authFailure) } }
+    if (Test-Path -LiteralPath $script:CRED_FILE) { return [int64](Get-Item -LiteralPath $script:CRED_FILE).LastWriteTimeUtc.Ticks }
+  } catch {}
+  return [int64]0
+}
+
+function Read-ClaudeOAuthCredential {
+  $stamp = Get-ClaudeCredentialStamp
+  if ($stamp -eq 0) {
+    return [pscustomobject]@{ ok=$false; token=$null; expiresAt=0; refreshTokenPresent=$false; stamp=$stamp; failure=(New-ClaudeFailure 'credentialMissing' 0 $stamp 'fileMissing') }
+  }
+  try {
+    $cred = Get-Content -LiteralPath $script:CRED_FILE -Raw -Encoding UTF8 | ConvertFrom-Json
+  } catch {
+    return [pscustomobject]@{ ok=$false; token=$null; expiresAt=0; refreshTokenPresent=$false; stamp=$stamp; failure=(New-ClaudeFailure 'credentialInvalid' 0 $stamp 'jsonInvalid') }
+  }
+  $oauth = $cred.claudeAiOauth
+  if (-not $oauth -or -not $oauth.accessToken) {
+    return [pscustomobject]@{ ok=$false; token=$null; expiresAt=0; refreshTokenPresent=[bool]$oauth.refreshToken; stamp=$stamp; failure=(New-ClaudeFailure 'tokenMissing' 0 $stamp 'accessTokenMissing') }
+  }
+  [int64]$expiresAt = 0
+  try { if ($oauth.expiresAt) { $expiresAt = [int64]$oauth.expiresAt } } catch {}
+  if ($expiresAt -gt 0 -and [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() -ge $expiresAt) {
+    return [pscustomobject]@{ ok=$false; token=$null; expiresAt=$expiresAt; refreshTokenPresent=[bool]$oauth.refreshToken; stamp=$stamp; failure=(New-ClaudeFailure 'tokenExpired' 0 $stamp 'accessTokenExpired') }
+  }
+  return [pscustomobject]@{ ok=$true; token=[string]$oauth.accessToken; expiresAt=$expiresAt; refreshTokenPresent=[bool]$oauth.refreshToken; stamp=$stamp; failure=$null }
+}
+
+# 안전한 로컬 진단. 토큰/이메일/orgId는 출력하지 않는다.
+function Get-ClaudeAuthDiagnostic {
+  $c = Read-ClaudeOAuthCredential
+  $cliLoggedIn = $null; $cliAuthMethod = $null; $cliVersion = $null
+  $claude = Find-Bin 'claude'
+  if ($claude) {
+    try {
+      $ver = Invoke-ExternalCommand -FilePath $claude -ArgumentList @('--version') -TimeoutMs 5000
+      if ($ver) { $cliVersion = $ver.Trim() }
+      $statusJson = Invoke-ExternalCommand -FilePath $claude -ArgumentList @('auth','status') -TimeoutMs 5000
+      if ($statusJson) {
+        $status = $statusJson | ConvertFrom-Json
+        $cliLoggedIn = [bool]$status.loggedIn; $cliAuthMethod = [string]$status.authMethod
+      }
+    } catch {}
+  }
+  $expiresUtc = $null
+  if ($c.expiresAt -gt 0) { try { $expiresUtc = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$c.expiresAt).UtcDateTime.ToString('o') } catch {} }
+  [pscustomobject]@{
+    credentialPath = $script:CRED_FILE; configSource = $(if ($env:CLAUDE_CONFIG_DIR) { 'CLAUDE_CONFIG_DIR' } else { 'USERPROFILE' })
+    credentialExists = ($c.stamp -gt 0)
+    credentialReadable = (-not $c.failure -or ($c.failure.kind -ne 'credentialMissing' -and $c.failure.kind -ne 'credentialInvalid'))
+    credentialState = $(if ($c.failure) { $c.failure.kind } else { 'ready' })
+    expiresAtUtc = $expiresUtc; refreshTokenPresent = [bool]$c.refreshTokenPresent
+    cliFound = [bool]$claude; cliVersion = $cliVersion; cliLoggedIn = $cliLoggedIn; cliAuthMethod = $cliAuthMethod
+  }
+}
+
+# API 1회 호출. HTTP 상태와 네트워크 오류를 분리하되 응답 본문/토큰은 로그에 남기지 않는다.
+function Invoke-UsageApiOnce {
+  param([string]$Token, [int64]$CredentialStamp)
+  $now = Get-UnixNow
   $headers = @{
-    'Authorization'  = "Bearer $tok"
+    'Authorization'  = "Bearer $Token"
     'anthropic-beta' = 'oauth-2025-04-20'
     'Content-Type'   = 'application/json'
   }
   try {
     $raw = Invoke-RestMethod -Uri $script:USAGE_API_URL -Headers $headers `
               -UserAgent "claude-code/$script:ClaudeUaVersion" -Method GET -TimeoutSec 15
+    $props = @($raw.PSObject.Properties.Name)
+    if ($props -notcontains 'five_hour' -and $props -notcontains 'seven_day' -and $props -notcontains 'limits') {
+      return [pscustomobject]@{ ok=$false; raw=$null; failure=(New-ClaudeFailure 'schemaChanged' 200 $CredentialStamp 'knownFieldsMissing') }
+    }
     return [pscustomobject]@{ ok=$true; raw=$raw; failure=$null }
   } catch {
-    $status = 0
-    $retryAt = 0
+    $status = 0; $retryAt = 0; $detail = 'requestFailed'
     try { if ($_.Exception.Response) { $status = [int]$_.Exception.Response.StatusCode } } catch {}
+    try { if ($_.Exception.Status) { $detail = [string]$_.Exception.Status } } catch {}
     if ($status -eq 429) {
       # Retry-After가 초 또는 HTTP 날짜일 수 있다. 읽지 못하면 호출부의 지수 백오프를 사용한다.
       try {
@@ -253,10 +325,37 @@ function Invoke-UsageApi {
         }
       } catch {}
     }
-    $kind = if ($status -eq 401) { 'auth' } elseif ($status -eq 429) { 'rateLimit' } else { 'network' }
-    $failure = [pscustomobject]@{ kind=$kind; statusCode=$status; failedAt=$now; retryAt=$retryAt }
+    $kind = if ($status -eq 401) { 'http401' } elseif ($status -eq 403) { 'http403' } elseif ($status -eq 429) { 'rateLimit' } elseif ($status -gt 0) { 'httpError' } else { 'network' }
+    $failure = New-ClaudeFailure $kind $status $CredentialStamp $detail
+    $failure.retryAt = $retryAt
     return [pscustomobject]@{ ok=$false; raw=$null; failure=$failure }
   }
+}
+
+# API 호출 — 401이면 회전됐을 수 있는 자격 증명을 다시 읽고 정확히 한 번 재시도한다.
+function Invoke-UsageApi {
+  if (-not $script:EnableUsageApi) { return [pscustomobject]@{ ok=$false; raw=$null; failure=$null } }
+  $credential = Read-ClaudeOAuthCredential
+  if (-not $credential.ok) {
+    Write-CcbLog ('Claude usage 실패: kind={0} status=0 stamp={1}' -f $credential.failure.kind, $credential.stamp)
+    return [pscustomobject]@{ ok=$false; raw=$null; failure=$credential.failure }
+  }
+  $result = Invoke-UsageApiOnce -Token $credential.token -CredentialStamp $credential.stamp
+  if (-not $result.ok -and $result.failure.kind -eq 'http401') {
+    $again = Read-ClaudeOAuthCredential
+    if ($again.ok) {
+      $result = Invoke-UsageApiOnce -Token $again.token -CredentialStamp $again.stamp
+      if ($result.failure) { $result.failure.retryPerformed = $true }
+      if ($result.ok) { Write-CcbLog 'Claude usage 복구: 401 후 자격 증명 재읽기 성공' }
+    } else {
+      $result = [pscustomobject]@{ ok=$false; raw=$null; failure=$again.failure }
+      $result.failure.retryPerformed = $true
+    }
+  }
+  if (-not $result.ok -and $result.failure) {
+    Write-CcbLog ('Claude usage 실패: kind={0} status={1} detail={2} stamp={3} retry={4}' -f $result.failure.kind, $result.failure.statusCode, $result.failure.detail, $result.failure.credentialStamp, $result.failure.retryPerformed)
+  }
+  return $result
 }
 
 # API 원본 응답 → 원본 getClaudeUsage와 동일한 정규화 구조로 변환
@@ -302,23 +401,37 @@ function Get-ClaudeUsage {
   $cacheAge = if ($cache -and $cache.fetchedAt) { $now - [int64]$cache.fetchedAt } else { [int64]::MaxValue }
   $backoffActive = ($cache -and $cache.backoffUntil -and ($now -lt [int64]$cache.backoffUntil))
 
-  $shouldCall = $script:EnableUsageApi -and ($Force -or ($cacheAge -ge $script:UsageApiThrottleSec)) -and (-not $backoffActive -or $Force)
+  # Claude Code가 백그라운드에서 토큰 파일을 교체했으면 이전 인증 백오프를 즉시 무효화한다.
+  $credentialChanged = $false
+  if ($cache -and $cache.failure) {
+    $currentStamp = Get-ClaudeCredentialStamp
+    [int64]$failedStamp = 0
+    try { if ($null -ne $cache.failure.credentialStamp) { $failedStamp = [int64]$cache.failure.credentialStamp } } catch {}
+    $credentialFailureKinds = @('credentialMissing','credentialInvalid','tokenMissing','tokenExpired','http401','http403','auth')
+    if ($credentialFailureKinds -contains [string]$cache.failure.kind) {
+      # 1.1.2의 auth 캐시에는 stamp가 없다. 유효한 파일이 있으면 업그레이드 직후 즉시 재검증한다.
+      $credentialChanged = (($currentStamp -ne $failedStamp) -or ($cache.failure.kind -eq 'auth' -and $currentStamp -gt 0))
+    }
+  }
+
+  $shouldCall = $script:EnableUsageApi -and ($Force -or $credentialChanged -or ($cacheAge -ge $script:UsageApiThrottleSec)) -and (-not $backoffActive -or $credentialChanged -or $Force)
 
   if ($shouldCall) {
     $api = Invoke-UsageApi
     if ($api.ok -and $api.raw) {
+      if ($cache -and $cache.failure) { Write-CcbLog ('Claude usage 정상화: previous={0}' -f $cache.failure.kind) }
       Write-UsageCache ([pscustomobject]@{ fetchedAt = $now; backoffUntil = 0; backoffInterval = 0; raw = $api.raw; failure = $null })
       return (ConvertFrom-UsageRaw -Raw $api.raw -MeasuredAt $now)
     } else {
       # 실패 → 백오프 갱신. 캐시 유무와 무관하게 반드시 기록해야 최초 실행(dead token 등)에서도
       # 재시도가 폭주하지 않는다. 직전 백오프 "간격"(interval, deadline이 아님)을 이어받아야
       # 300→600→1200→…→cap 으로 실제 두 배씩 늘어난다.
-      # 이미 기록된 간격이 있으면 그걸 두 배로, 없으면(최초 실패) 기준값에서 시작 — 300→600→1200→…→cap.
-      $next = if ($cache -and $cache.backoffInterval -and [int64]$cache.backoffInterval -gt 0) {
+      # 네트워크/레이트리밋만 지수 백오프한다. 인증 계열은 파일 변경 감지와 5분 고정 재검증으로 회복한다.
+      $exponentialKinds = @('network','rateLimit','httpError')
+      $useExponential = ($api.failure -and ($exponentialKinds -contains [string]$api.failure.kind))
+      $next = if ($useExponential -and $cache -and $cache.backoffInterval -and [int64]$cache.backoffInterval -gt 0) {
         [math]::Min([int64]$cache.backoffInterval * 2, $script:UsageApiMaxBackoff)
-      } else {
-        $script:UsageApiThrottleSec
-      }
+      } else { $script:UsageApiThrottleSec }
       $updated = if ($cache) { $cache } else { [pscustomobject]@{ fetchedAt = $null; raw = $null } }
       if ($api.failure) {
         if (-not $api.failure.retryAt) { $api.failure.retryAt = $now + $next }
@@ -658,6 +771,7 @@ if ($Probe) {
     Write-Host ''
   }
   switch ($Probe.ToLower()) {
+    'auth'   { & $dump 'Get-ClaudeAuthDiagnostic' (Get-ClaudeAuthDiagnostic) }
     'claude' { & $dump 'Get-ClaudeUsage'  (Get-ClaudeUsage -Force:$ForceApi) }
     'codex'  { & $dump 'Get-CodexUsage'   (Get-CodexUsage) }
     'models' { & $dump 'Get-ClaudeModels' (Get-ClaudeModels) }
@@ -668,7 +782,7 @@ if ($Probe) {
       & $dump 'Get-ClaudeBlocks' (Get-ClaudeBlocks)
       & $dump 'Get-ClaudeModels' (Get-ClaudeModels)
     }
-    default { Write-Host "알 수 없는 -Probe: $Probe (claude|codex|models|blocks|all)" -ForegroundColor Yellow }
+    default { Write-Host "알 수 없는 -Probe: $Probe (auth|claude|codex|models|blocks|all)" -ForegroundColor Yellow }
   }
   return
 }
@@ -1010,6 +1124,7 @@ function Get-HeatRemainColor {
 # ══════════════════════════════════════════════════════════════════
 $script:SELF_PATH = $MyInvocation.MyCommand.Path
 $script:SELF_DIR  = if ($script:SELF_PATH) { Split-Path -Parent $script:SELF_PATH } else { $PWD.Path }
+$script:BUILD_SHA = try { (Get-FileHash -LiteralPath $script:SELF_PATH -Algorithm SHA256).Hash.Substring(0,8).ToLowerInvariant() } catch { 'unknown' }
 $script:STARTUP_LNK = Join-Path ([Environment]::GetFolderPath('Startup')) 'Claude Codex Battery.lnk'
 
 function Test-Autostart { return (Test-Path $script:STARTUP_LNK) }
@@ -1238,7 +1353,8 @@ function Build-DetailMenu {
   $menu.Items.Add($blog) | Out-Null
 
   $menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator)) | Out-Null
-  Add-Label $menu ('v{0}  ·  Claude & Codex Usage Battery' -f $script:VERSION) $gray $script:MONO_SM | Out-Null
+  Add-Label $menu ('v{0}  ·  sha {1}  ·  Claude & Codex Usage Battery' -f $script:VERSION, $script:BUILD_SHA) $gray $script:MONO_SM | Out-Null
+  Add-Label $menu ('실행: {0}' -f $script:SELF_PATH) $gray $script:MONO_SM | Out-Null
 
   return $menu
 }

@@ -74,14 +74,17 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 
 `install.ps1`은:
 
-1. 앱 파일을 `%LOCALAPPDATA%\claude-codex-battery\`에 복사
-2. 시작프로그램에 등록(재부팅 후 자동 실행) — 콘솔 창 없이 뜨는 `launch-hidden.vbs` 런처 사용
-3. 즉시 실행
+1. 같은 설치 경로에서 실행 중인 기존 트레이 프로세스를 종료
+2. 앱 파일을 `%LOCALAPPDATA%\claude-codex-battery\`에 복사
+3. 시작프로그램에 등록(재부팅 후 자동 실행) — 콘솔 창 없이 뜨는 `launch-hidden.vbs` 런처 사용
+4. 설치한 새 버전으로 즉시 실행
 
 몇 초 안에 트레이에 배터리가 나타납니다. **2분마다** 갱신됩니다. (`-NoAutostart` / `-NoLaunch` 옵션으로 각각 건너뛸 수 있습니다.)
 
-갱신에 실패하면 트레이 툴팁과 메뉴에서 이유를 확인할 수 있습니다. 만료된 Claude 로그인은
-`재로그인 필요`, API 제한은 `레이트 리밋 · N분 후 재시도`, 네트워크 장애는 마지막 측정 경과 시간으로 표시됩니다.
+갱신에 실패하면 트레이 툴팁과 메뉴에서 이유를 확인할 수 있습니다. 자격 증명 파일 없음/손상,
+토큰 없음/만료, HTTP 401/403, API 응답 형식 변경, 레이트 리밋과 네트워크 장애를 서로 구분합니다.
+401이면 Claude Code가 회전시킨 자격 증명을 다시 읽어 한 번 재시도하며, 자격 증명 파일이 바뀌면
+기존 인증 백오프를 즉시 해제합니다.
 
 메뉴의 `Windows 로그인 시 자동 실행 (켜짐/꺼짐)` 항목으로 시작프로그램 등록을 전환할 수 있습니다.
 `메뉴 닫기`는 팝업만 닫고, `트레이 앱 완전히 종료`는 상주 앱을 종료합니다. 메뉴 하단에서
@@ -97,7 +100,7 @@ powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File claude-c
 
 ## 업데이트
 
-포크 레포의 `VERSION`을 **하루 최대 1회** 확인합니다(백그라운드, 유일한 그 외 네트워크 호출). 새 버전이 있으면 드롭다운에 초록 **🆕 업데이트** 항목이 뜨고, 클릭하면 제자리에서 교체 후 재시작합니다(이전본은 `.bak` 보존).
+포크 레포의 `VERSION`을 **하루 최대 1회** 확인합니다(백그라운드, 유일한 그 외 네트워크 호출). 새 버전이 있으면 드롭다운에 초록 **🆕 업데이트** 항목이 뜨고, 클릭하면 제자리에서 교체 후 재시작합니다(이전본은 `.bak` 보존). 메뉴 하단에서 실제 실행 버전, 스크립트 SHA-256 앞 8자리와 실행 경로를 확인할 수 있습니다.
 
 직접 하려면: `git pull` 후 `install.ps1` 재실행.
 
@@ -124,6 +127,7 @@ powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File claude-c
 - **트레이 아이콘**은 `System.Drawing.Bitmap`에 캡슐/픽셀폰트 숫자를 그려 `GetHicon()`으로 아이콘화합니다. 핸들은 매 갱신마다 `DestroyIcon`으로 해제해 GDI 누수를 막습니다.
 - **다크/라이트**는 레지스트리 `SystemUsesLightTheme`로 감지해 매 갱신 반영합니다.
 - **Claude 한도**는 usage API 응답에서 옵니다. 응답은 원본이 읽던 `usage-cache.json`의 상위집합이라(`five_hour` / `seven_day` / `limits[]`), 파싱 로직을 거의 그대로 재사용했습니다. API는 공격적 rate-limit이 있어 **최소 5분 간격**으로만 호출하고 결과를 `%LOCALAPPDATA%\claude-codex-battery\usage-cache.json`에 캐시합니다.
+- **Claude 인증**은 `CLAUDE_CONFIG_DIR`이 설정되어 있으면 그 경로를, 아니면 `%USERPROFILE%\.claude\.credentials.json`을 사용합니다. 진단 로그에는 토큰·이메일·조직 ID를 기록하지 않습니다.
 - **Codex 한도**는 가장 최근 세션 로그의 `rate_limits`에서 옵니다.
 - 데이터 조회는 별도 러너스페이스에서 실행하므로 느린 네트워크나 선택 의존성(`ccusage`)이 트레이 UI를 멈추지 않습니다.
 - 사용량 캐시는 임시 파일 작성 후 원자적으로 교체하며, 손상된 업데이트 스크립트는 설치 전에 구문 검사로 차단합니다.
@@ -139,6 +143,18 @@ powershell -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File claude-c
 | API 호출 최소 간격 | `$UsageApiThrottleSec` (기본 300초) |
 | Codex 소진 시 자동 갱신 | `$CodexAutoRefresh` (기본 off) |
 | 갱신 주기 | `Start-ResidentTray`의 `Timer.Interval` (기본 120000ms) |
+
+---
+
+## 인증 진단
+
+네트워크 요청 없이 Claude Code 로그인과 로컬 자격 증명 상태만 확인하려면:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\claude-codex-battery-win.ps1 -Probe auth
+```
+
+토큰 값, 이메일과 조직 ID는 출력하지 않습니다. 실제 usage API 호출까지 확인하려면 `-Probe claude -ForceApi`를 사용하며, 이 경우 API 호출 및 로컬 사용량 캐시 갱신이 발생합니다.
 
 ---
 

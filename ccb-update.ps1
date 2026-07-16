@@ -65,11 +65,17 @@ foreach ($scriptName in @('claude-codex-battery-win.ps1','ccb-update.ps1')) {
 # 실행 중인 인스턴스 중지 (명령줄에 이 스크립트 경로 + -Run 포함하는 powershell)
 Write-Host "실행 중 인스턴스 중지..."
 try {
-  Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" | Where-Object {
-    $_.CommandLine -and $_.CommandLine -like ('*' + [System.IO.Path]::GetFileName($mainPs1) + '*') -and $_.CommandLine -like '*-Run*'
-  } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+  $fullMain = [System.IO.Path]::GetFullPath($mainPs1)
+  $stopped = @(Get-CimInstance Win32_Process -Filter "Name='powershell.exe' OR Name='pwsh.exe'" | Where-Object {
+    $_.CommandLine -and $_.CommandLine.IndexOf($fullMain, [StringComparison]::OrdinalIgnoreCase) -ge 0 -and $_.CommandLine -match '(?i)(?:^|\s)-Run(?:\s|$)'
+  } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop; $_.ProcessId })
+  $deadline = [DateTime]::UtcNow.AddSeconds(5)
+  do {
+    $alive = @($stopped | Where-Object { Get-Process -Id $_ -ErrorAction SilentlyContinue })
+    if ($alive.Count -eq 0) { break }
+    Start-Sleep -Milliseconds 100
+  } while ([DateTime]::UtcNow -lt $deadline)
 } catch {}
-Start-Sleep -Milliseconds 500
 
 # 백업 후 교체 — 도중에 실패하면 지금까지 백업해 둔 .bak으로 롤백한다.
 $backedUp = @()
